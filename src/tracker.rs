@@ -1,3 +1,9 @@
+use serde_bencode::{from_bytes, value::Value};
+
+fn percent_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("%{:02X}", b)).collect()
+}
+
 pub fn contact_tracker(
     announce_url: &str,
     info_hash: &[u8; 20],
@@ -45,9 +51,4 @@ pub fn contact_tracker(
 }
 
     Ok(())
-}
-
-pub struct PeerAddress {
-    pub ip: String,
-    pub port: u16,
 }
