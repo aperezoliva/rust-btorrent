@@ -1,6 +1,6 @@
 // Libraries for decoding, file I/O, hashing, and communicating with a tracker
 // Also draws in from other files' functions
-use crate::tracker::contact_tracker;
+use crate::peer;
 use crate::tracker::PeerInfo;
 use serde::{Deserialize, Serialize};
 use serde_bencode::{from_bytes, value::Value};
@@ -11,11 +11,11 @@ use std::fs;
 // Struct representing the 'info' dictionary usually supplied by a torrent file
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Info {
-    name: String,
-    length: Option<u64>,
+    pub name: String,
+    pub length: Option<u64>,
     #[serde(default)]
-    piece_length: u64,
-    pieces: ByteBuf,
+    pub piece_length: u64,
+    pub pieces: ByteBuf,
 }
 
 // Main structure of a torrent file
@@ -53,15 +53,74 @@ impl eframe::App for TorrentApp {
 
             if ui.button("Load Torrent").clicked() {
                 match parse_torrent_file(&self.file_path) {
-                    Ok((torrent, peers)) => {
+                    Ok(torrent) => {
                         self.torrent = Some(torrent);
-                        self.peers = peers;
+                        self.peers.clear(); // clears old peers just incase
                     }
                     Err(e) => {
                         eprintln!("Failed to parse: {}", e);
                         self.torrent = None;
                         self.peers.clear();
                     }
+                }
+            }
+
+            if ui.button("Find Peers").clicked() {
+                if let Some(ref torrent) = self.torrent {
+                    let info_hash = compute_info_hash(&torrent.info);
+                    match crate::tracker::contact_tracker(
+                        &torrent.announce,
+                        &info_hash,
+                        torrent.info.length.unwrap_or(0),
+                    ) {
+                        Ok(peers) => {
+                            self.peers = peers;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to contact tracker: {}", e);
+                        }
+                    }
+                }
+            }
+            if ui.button("Download Piece 0").clicked() {
+                if let (Some(ref torrent), Some(peer)) = (self.torrent.as_ref(), self.peers.first())
+                {
+                    let info_hash = compute_info_hash(&torrent.info);
+                    let peer_id = crate::peer::generate_peer_id(); // Generate new peer_id
+
+                    // Attempt to connect to the first peer
+                    match std::net::TcpStream::connect((peer.ip.as_str(), peer.port)) {
+                        Ok(mut stream) => {
+                            println!("Connected to peer {}:{}", peer.ip, peer.port);
+
+                            if crate::peer::perform_handshake(&mut stream, &info_hash, &peer_id)
+                                .is_ok()
+                                && crate::peer::send_interested(&mut stream).is_ok()
+                                && crate::peer::wait_for_unchoke(&mut stream).is_ok()
+                            {
+                                let piece_length = torrent.info.piece_length as u32; // Always safe to cast here
+                                match crate::peer::download_piece(&mut stream, 0, piece_length) {
+                                    Ok(piece_data) => {
+                                        if std::fs::write("piece_0.bin", &piece_data).is_ok() {
+                                            println!("Successfully downloaded and saved piece 0!");
+                                        } else {
+                                            eprintln!("Failed to save piece 0 to disk.");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to download piece: {}", e);
+                                    }
+                                }
+                            } else {
+                                eprintln!("Handshake or interested/unchoke failed.");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to connect to peer: {}", e);
+                        }
+                    }
+                } else {
+                    eprintln!("No torrent loaded or no peers available!");
                 }
             }
             // doesnt work for some reason, please delete this comment if it working
@@ -131,9 +190,8 @@ pub fn compute_info_hash(info: &Info) -> [u8; 20] {
     result.into()
 }
 
-pub fn parse_torrent_file(
-    path: &str,
-) -> Result<(Torrent, Vec<PeerInfo>), Box<dyn std::error::Error>> {
+// Only loads the torrent file and parses it into a Torrent struct, doesn't contact tracker yet
+pub fn parse_torrent_file(path: &str) -> Result<Torrent, Box<dyn std::error::Error>> {
     // Trim quotes around path just incase, this is unnecessary tbh
     let path = path.trim_matches('"');
     println!("Trying to load file: {}", path);
@@ -155,31 +213,14 @@ pub fn parse_torrent_file(
         Err(e) => eprintln!("Failed to decode raw bencode: {}", e),
     }
 
-    // Deserialize decoded data into a torrent struct
+    // Deserialize decoded data into a Torrent struct
     let torrent: Torrent = from_bytes(&data)?;
-
-    // Self explanatory
-    let info_hash = compute_info_hash(&torrent.info);
-
-    println!("Info Hash: {:?}", hex::encode(info_hash));
-
-    // Attempt to contact tracker
-    contact_tracker(
-        &torrent.announce,
-        &info_hash,
-        torrent.info.length.unwrap_or(0),
-    )?;
 
     if let Ok(decoded) = serde_bencode::from_bytes::<Value>(&data) {
         println!("Decoded Bencode Tree:");
         print_bencode_tree(&decoded, 0);
     }
-    let peers = contact_tracker(
-        &torrent.announce,
-        &info_hash,
-        torrent.info.length.unwrap_or(0),
-    )?;
 
-    // Return parsed torrent peer info
-    Ok((torrent, peers))
+    // Return the loaded torrent, tracker contact is now separate
+    Ok(torrent)
 }
