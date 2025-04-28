@@ -1,10 +1,10 @@
-use serde_bytes::ByteBuf;
-use std::fs;
-use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
-use serde_bencode::{from_bytes, value::Value};
-
 use crate::tracker::contact_tracker;
+use crate::tracker::PeerInfo;
+use serde::{Deserialize, Serialize};
+use serde_bencode::{from_bytes, value::Value};
+use serde_bytes::ByteBuf;
+use sha1::{Digest, Sha1};
+use std::fs;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Info {
@@ -24,6 +24,7 @@ pub struct Torrent {
 pub struct TorrentApp {
     torrent: Option<Torrent>,
     file_path: String,
+    peers: Vec<PeerInfo>,
 }
 
 impl Default for TorrentApp {
@@ -31,6 +32,7 @@ impl Default for TorrentApp {
         Self {
             torrent: None,
             file_path: "example.torrent".to_string(),
+            peers: Vec::new(),
         }
     }
 }
@@ -44,8 +46,15 @@ impl eframe::App for TorrentApp {
 
             if ui.button("Load Torrent").clicked() {
                 match parse_torrent_file(&self.file_path) {
-                    Ok(torrent) => self.torrent = Some(torrent),
-                    Err(e) => eprintln!("Failed to parse: {}", e),
+                    Ok((torrent, peers)) => {
+                        self.torrent = Some(torrent);
+                        self.peers = peers;
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to parse: {}", e);
+                        self.torrent = None;
+                        self.peers.clear();
+                    }
                 }
             }
 
@@ -56,6 +65,15 @@ impl eframe::App for TorrentApp {
                     ui.label(format!("Length: {} bytes", length));
                 }
                 ui.label(format!("Piece Length: {} bytes", torrent.info.piece_length));
+                ui.separator();
+                ui.heading("Connected Peers:");
+                if self.peers.is_empty() {
+                    ui.label("No peers found.");
+                } else {
+                    for peer in &self.peers {
+                        ui.label(format!("{}:{}", peer.ip, peer.port));
+                    }
+                }
             }
         });
     }
@@ -102,7 +120,9 @@ pub fn compute_info_hash(info: &Info) -> [u8; 20] {
     result.into()
 }
 
-pub fn parse_torrent_file(path: &str) -> Result<Torrent, Box<dyn std::error::Error>> {
+pub fn parse_torrent_file(
+    path: &str,
+) -> Result<(Torrent, Vec<PeerInfo>), Box<dyn std::error::Error>> {
     let path = path.trim_matches('"');
     println!("Trying to load file: {}", path);
 
@@ -131,9 +151,14 @@ pub fn parse_torrent_file(path: &str) -> Result<Torrent, Box<dyn std::error::Err
     )?;
 
     if let Ok(decoded) = serde_bencode::from_bytes::<Value>(&data) {
-    println!("Decoded Bencode Tree:");
-    print_bencode_tree(&decoded, 0);
-}
+        println!("Decoded Bencode Tree:");
+        print_bencode_tree(&decoded, 0);
+    }
+    let peers = contact_tracker(
+        &torrent.announce,
+        &info_hash,
+        torrent.info.length.unwrap_or(0),
+    )?;
 
-    Ok(torrent)
+    Ok((torrent, peers))
 }

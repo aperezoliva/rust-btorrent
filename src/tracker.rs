@@ -1,5 +1,11 @@
 use serde_bencode::{from_bytes, value::Value};
 
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    pub ip: String,
+    pub port: u16,
+}
+
 fn percent_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("%{:02X}", b)).collect()
 }
@@ -8,14 +14,14 @@ pub fn contact_tracker(
     announce_url: &str,
     info_hash: &[u8; 20],
     file_size: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Vec<PeerInfo>, Box<dyn std::error::Error>> {
     let peer_id = "-RT0001-123456789012";
     let info_hash_encoded = percent_encode(info_hash);
     let peer_id_encoded = percent_encode(peer_id.as_bytes());
-
+    let mut peers_list = Vec::new();
     if !announce_url.starts_with("http") {
         println!("Skipping non-HTTP tracker: {}", announce_url);
-        return Ok(());
+        return Ok((Vec::new()));
     }
 
     let url = format!(
@@ -29,26 +35,26 @@ pub fn contact_tracker(
     // Parse tracker response as bencoded dictionary
     let tracker_response: Value = from_bytes(&response)?;
     if let Value::Dict(dict) = tracker_response {
-    if let Some(peers_value) = dict.get(&b"peers"[..]) {
-        if let Value::Bytes(peers) = peers_value {
-            println!("Peers:");
-            for chunk in peers.chunks(6) {
-                if chunk.len() < 6 {
-                    continue;
+        if let Some(peers_value) = dict.get(&b"peers"[..]) {
+            if let Value::Bytes(peers) = peers_value {
+                for chunk in peers.chunks(6) {
+                    if chunk.len() < 6 {
+                        continue;
+                    }
+                    let ip = format!("{}.{}.{}.{}", chunk[0], chunk[1], chunk[2], chunk[3]);
+                    let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+                    println!("Peer: {}:{}", ip, port);
+                    peers_list.push(PeerInfo { ip, port });
                 }
-                let ip = format!("{}.{}.{}.{}", chunk[0], chunk[1], chunk[2], chunk[3]);
-                let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-                println!("  {}:{}", ip, port);
+            } else {
+                println!("`peers` field is not a byte string.");
             }
         } else {
-            println!("`peers` field is not a byte string.");
+            println!("No `peers` key found in tracker response.");
         }
     } else {
-        println!("No `peers` key found in tracker response.");
+        println!("Tracker response is not a dict.");
     }
-} else {
-    println!("Tracker response is not a dict.");
-}
 
-    Ok(())
+    Ok(peers_list)
 }
