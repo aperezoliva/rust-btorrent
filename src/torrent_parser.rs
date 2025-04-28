@@ -1,3 +1,5 @@
+// Libraries for decoding, file I/O, hashing, and communicating with a tracker
+// Also draws in from other files' functions
 use crate::tracker::contact_tracker;
 use crate::tracker::PeerInfo;
 use serde::{Deserialize, Serialize};
@@ -6,6 +8,7 @@ use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
 use std::fs;
 
+// Struct representing the 'info' dictionary usually supplied by a torrent file
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Info {
     name: String,
@@ -15,18 +18,21 @@ pub struct Info {
     pieces: ByteBuf,
 }
 
+// Main structure of a torrent file
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Torrent {
     pub announce: String,
     pub info: Info,
 }
 
+// Gui state for the app
 pub struct TorrentApp {
     torrent: Option<Torrent>,
     file_path: String,
     peers: Vec<PeerInfo>,
 }
 
+// Default initialization for the app (empty torrent, default file path, no peers)
 impl Default for TorrentApp {
     fn default() -> Self {
         Self {
@@ -37,6 +43,7 @@ impl Default for TorrentApp {
     }
 }
 
+// Main gui rendering and event handling function for the gui window
 impl eframe::App for TorrentApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -57,7 +64,8 @@ impl eframe::App for TorrentApp {
                     }
                 }
             }
-
+            // doesnt work for some reason, please delete this comment if it working
+            // PLEASE
             if let Some(ref torrent) = self.torrent {
                 ui.label(format!("Announce URL: {}", torrent.announce));
                 ui.label(format!("Name: {}", torrent.info.name));
@@ -79,6 +87,8 @@ impl eframe::App for TorrentApp {
     }
 }
 
+// Bencode data gets printed recursively for debugging purposes, might comment out since it's slowing
+// The terminal (i think)
 fn print_bencode_tree(value: &Value, indent: usize) {
     let pad = " ".repeat(indent);
     match value {
@@ -112,6 +122,7 @@ fn print_bencode_tree(value: &Value, indent: usize) {
     }
 }
 
+// Compute the SHA-1 hash of the serialized 'info' dictionary for tracker and peer identification
 pub fn compute_info_hash(info: &Info) -> [u8; 20] {
     let encoded_info = serde_bencode::to_bytes(info).expect("Failed to encode info dict");
     let mut hasher = Sha1::new();
@@ -123,27 +134,36 @@ pub fn compute_info_hash(info: &Info) -> [u8; 20] {
 pub fn parse_torrent_file(
     path: &str,
 ) -> Result<(Torrent, Vec<PeerInfo>), Box<dyn std::error::Error>> {
+    // Trim quotes around path just incase, this is unnecessary tbh
     let path = path.trim_matches('"');
     println!("Trying to load file: {}", path);
 
+    // Like any other good program, check if the object (file) is there, if not, yell at the user
     if !std::path::Path::new(path).exists() {
         eprintln!("Error: File '{}' does not exist!", path);
         return Err("File not found".into());
     }
 
+    // Reads raw bytes and prints hex data
     let data = fs::read(path)?;
     println!("Raw data (hex): {:?}", hex::encode(&data));
 
+    // Try to decode bencode
+    // https://en.wikipedia.org/wiki/Bencode it's pronounced BEE-encode btw
     match serde_bencode::from_bytes::<Value>(&data) {
         Ok(decoded) => println!("Decoded Bencode: {:?}", decoded),
         Err(e) => eprintln!("Failed to decode raw bencode: {}", e),
     }
 
+    // Deserialize decoded data into a torrent struct
     let torrent: Torrent = from_bytes(&data)?;
+
+    // Self explanatory
     let info_hash = compute_info_hash(&torrent.info);
 
     println!("Info Hash: {:?}", hex::encode(info_hash));
 
+    // Attempt to contact tracker
     contact_tracker(
         &torrent.announce,
         &info_hash,
@@ -160,5 +180,6 @@ pub fn parse_torrent_file(
         torrent.info.length.unwrap_or(0),
     )?;
 
+    // Return parsed torrent peer info
     Ok((torrent, peers))
 }

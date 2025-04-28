@@ -1,15 +1,22 @@
 use serde_bencode::{from_bytes, value::Value};
 
+// Basic peer info
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
     pub ip: String,
     pub port: u16,
 }
 
+// Takes raw bytes and encodes them
+// Need this for trackers
 fn percent_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("%{:02X}", b)).collect()
 }
 
+/* Not sure why im not using comment blocks more often
+regardless, this is for contacting trackers
+info_hash -> identifies torrents
+peer_id -> identifies client (hardcoded) */
 pub fn contact_tracker(
     announce_url: &str,
     info_hash: &[u8; 20],
@@ -20,10 +27,12 @@ pub fn contact_tracker(
     let peer_id_encoded = percent_encode(peer_id.as_bytes());
     let mut peers_list = Vec::new();
     if !announce_url.starts_with("http") {
+        // Skipping non-HTTP trackers for now, will implement HTTPS and UDP ones later (when i feel like it)
         println!("Skipping non-HTTP tracker: {}", announce_url);
         return Ok((Vec::new()));
     }
 
+    // Constructs the full announce url
     let url = format!(
         "{}?info_hash={}&peer_id={}&port=36363&uploaded=0&downloaded=0&left={}&compact=1",
         announce_url, info_hash_encoded, peer_id_encoded, file_size
@@ -34,6 +43,8 @@ pub fn contact_tracker(
 
     // Parse tracker response as bencoded dictionary
     let tracker_response: Value = from_bytes(&response)?;
+
+    // Extracts peers from response
     if let Value::Dict(dict) = tracker_response {
         if let Some(peers_value) = dict.get(&b"peers"[..]) {
             if let Value::Bytes(peers) = peers_value {
@@ -56,5 +67,6 @@ pub fn contact_tracker(
         println!("Tracker response is not a dict.");
     }
 
+    // Returns list of peers
     Ok(peers_list)
 }
