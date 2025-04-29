@@ -536,12 +536,12 @@ pub fn compute_info_hash(metadata: &[u8]) -> [u8; 20] {
 }
 
 fn parse_metadata(metadata: &[u8]) -> Result<Torrent, Box<dyn std::error::Error>> {
-    let info: Info = from_bytes(metadata)?;
+    let info_value: Info = from_bytes(metadata)?;
 
     let torrent = Torrent {
         announce: None,      // No announce URL from metadata
         announce_list: None, // No announce-list either
-        info,
+        info: info_value,
     };
 
     Ok(torrent)

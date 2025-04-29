@@ -1,5 +1,6 @@
 use crate::tracker::PeerInfo;
 use egui::ProgressBar;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_bencode::{from_bytes, value::Value};
 use serde_bytes::ByteBuf;
@@ -94,7 +95,7 @@ impl eframe::App for TorrentApp {
                     let info_hash = compute_info_hash(&loaded_torrent.info_bytes);
                     let mut handles = Vec::new();
                     let peer_id = crate::peer::generate_peer_id(); // Single peer_id for all connections
-                    println!("Computed info_hash: {:?}", hex::encode(info_hash));
+
                     // Try primary announce URL first
                     if let Some(ref announce_url) = torrent.announce {
                         let info_hash = info_hash.clone();
@@ -307,14 +308,14 @@ pub fn parse_torrent_file(path: &str) -> Result<LoadedTorrent, Box<dyn std::erro
     let decoded = serde_bencode::from_bytes::<Value>(&data)?;
 
     // Dig inside top-level dictionary to find the 'info' dictionary
-    let _info_value = match &decoded {
+    let info_value = match &decoded {
         Value::Dict(dict) => dict.get(&b"info"[..]).ok_or("Missing 'info' field")?,
         _ => return Err("Torrent file is not a bencoded dictionary".into()),
     };
 
-    // --- Major change: instead of re-serializing, extract exact original 'info' dict bytes ---
-    let info_offset = find_info_offset(&data)?;
-    let info_bytes = extract_info_bytes(&data[info_offset..])?;
+    // Re-serialize just the 'info' dictionary back into bencode
+    // Important: because tracker and peers expect EXACT same info_hash
+    let info_bytes = serde_bencode::to_bytes(info_value)?;
 
     // Deserialize full .torrent file into Torrent struct
     let torrent: Torrent = from_bytes(&data)?;
@@ -357,52 +358,6 @@ pub fn parse_torrent_file(path: &str) -> Result<LoadedTorrent, Box<dyn std::erro
     })
 }
 
-// Helper function: finds offset where '4:info' begins
-fn find_info_offset(data: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
-    let pattern = b"4:info";
-    if let Some(pos) = data.windows(pattern.len()).position(|w| w == pattern) {
-        Ok(pos + pattern.len()) // Move past "4:info"
-    } else {
-        Err("Failed to find 'info' dictionary in file".into())
-    }
-}
-
-// Helper function: parses and extracts exact bytes for 'info' dictionary
-fn extract_info_bytes(info_start: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut depth = 0;
-    let mut in_list_or_dict = false;
-    let mut end_pos = 0;
-    for (i, &b) in info_start.iter().enumerate() {
-        match b {
-            b'd' | b'l' => {
-                if !in_list_or_dict {
-                    in_list_or_dict = true;
-                }
-                depth += 1;
-            }
-            b'e' => {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
-                if depth == 0 {
-                    end_pos = i;
-                    break;
-                }
-            }
-            _ => continue,
-        }
-    }
-    if end_pos == 0 {
-        return Err("Failed to find end of 'info' dictionary".into());
-    }
-
-    // Include leading 'd' and trailing 'e'
-    let mut full_info_bytes = Vec::new();
-    full_info_bytes.push(b'd');
-    full_info_bytes.extend_from_slice(&info_start[..=end_pos]);
-    Ok(full_info_bytes)
-}
 pub fn download_pieces(
     peers: &[PeerInfo],
     torrent: &Torrent,
@@ -417,26 +372,6 @@ pub fn download_pieces(
     let info_hash = compute_info_hash(info_bytes);
     let peer_id = crate::peer::generate_peer_id(); // Generate new peer_id
 
-    // Grab total file length and piece info
-    let total_length = torrent.info.length.ok_or("Missing total file length.")?;
-    let piece_length = torrent.info.piece_length as u32;
-
-    if piece_length == 0 {
-        return Err("Invalid torrent: piece length is zero.".into());
-    }
-
-    // Calculate number of pieces based on total length and piece size
-    let num_pieces = (total_length + piece_length as u64 - 1) / piece_length as u64;
-
-    // All SHA1 hashes are packed into this byte buffer
-    let piece_hashes = torrent.info.pieces.as_ref();
-
-    let mut output = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open("final_output.bin")?;
-
-    // We'll iterate over every peer — if one fails, move to the next
     for peer in &peers {
         println!("Trying to connect to {}:{}", peer.ip, peer.port);
 
@@ -449,6 +384,20 @@ pub fn download_pieces(
                     && crate::peer::wait_for_unchoke(&mut stream).is_ok()
                 {
                     println!("Handshake, interested, and unchoke successful!");
+
+                    let total_length = torrent.info.length.unwrap_or(0);
+                    let piece_length = torrent.info.piece_length as u32;
+
+                    if piece_length == 0 {
+                        return Err("Invalid torrent: piece length is zero.".into());
+                    }
+
+                    let num_pieces = (total_length + piece_length as u64 - 1) / piece_length as u64;
+
+                    let mut output = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .open("final_output.bin")?;
 
                     match piece_index {
                         Some(single_piece) => {
@@ -469,24 +418,6 @@ pub fn download_pieces(
                                 expected_length,
                             ) {
                                 Ok(piece_data) => {
-                                    // Check SHA1 hash before writing
-                                    let expected_hash = &piece_hashes[(single_piece as usize * 20)
-                                        ..((single_piece as usize + 1) * 20)];
-                                    let actual_hash = {
-                                        let mut hasher = sha1::Sha1::new();
-                                        hasher.update(&piece_data);
-                                        hasher.finalize()
-                                    };
-
-                                    if actual_hash.as_slice() != expected_hash {
-                                        eprintln!(
-                                            "Hash mismatch for piece {}. Skipping.",
-                                            single_piece
-                                        );
-                                        continue;
-                                    }
-
-                                    // Write to correct position in file
                                     let offset = (single_piece as u64) * piece_length as u64;
                                     output.seek(SeekFrom::Start(offset))?;
                                     output.write_all(&piece_data)?;
@@ -497,12 +428,11 @@ pub fn download_pieces(
                                 }
                                 Err(e) => {
                                     eprintln!("Failed to download piece {}: {}", single_piece, e);
-                                    continue;
+                                    continue; // Try next peer
                                 }
                             }
                         }
                         None => {
-                            // Download ALL pieces sequentially
                             for piece_idx in 0..num_pieces {
                                 let expected_length = if piece_idx == num_pieces - 1 {
                                     let remaining = (total_length % piece_length as u64) as u32;
@@ -526,36 +456,14 @@ pub fn download_pieces(
                                     expected_length,
                                 ) {
                                     Ok(piece_data) => {
-                                        // SHA1 hash check
-                                        let expected_hash = &piece_hashes[(piece_idx as usize * 20)
-                                            ..((piece_idx as usize + 1) * 20)];
-                                        let actual_hash = {
-                                            let mut hasher = sha1::Sha1::new();
-                                            hasher.update(&piece_data);
-                                            hasher.finalize()
-                                        };
-
-                                        if actual_hash.as_slice() != expected_hash {
-                                            eprintln!(
-                                                "Hash mismatch for piece {}. Skipping.",
-                                                piece_idx
-                                            );
-                                            break;
-                                        }
-
-                                        // Write to output
                                         let offset = piece_idx * piece_length as u64;
                                         output.seek(SeekFrom::Start(offset))?;
                                         output.write_all(&piece_data)?;
                                         println!("Wrote piece {} into output", piece_idx);
-
-                                        // GUI progress update logic (optional)
-                                        let progress = (piece_idx + 1) as f32 / num_pieces as f32;
-                                        // TODO: expose this as mutable if you want to update the GUI
                                     }
                                     Err(e) => {
                                         eprintln!("Failed to download piece {}: {}", piece_idx, e);
-                                        break;
+                                        break; // Try another peer maybe
                                     }
                                 }
                             }
