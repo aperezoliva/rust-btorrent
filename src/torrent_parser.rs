@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use serde_bencode::{from_bytes, value::Value};
 use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
-use std::fs;
 
 // Struct representing the 'info' dictionary usually supplied by a torrent file
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,50 +174,69 @@ impl eframe::App for TorrentApp {
             }
             // Download Piece 0 Button
             if ui.button("Download Piece 0").clicked() {
-                if let (Some(ref loaded_torrent), Some(peer)) =
-                    (self.loaded_torrent.as_ref(), self.peers.first())
-                {
+                if let Some(ref loaded_torrent) = self.loaded_torrent {
                     let torrent = &loaded_torrent.torrent;
                     let info_hash = compute_info_hash(&loaded_torrent.info_bytes);
                     let peer_id = crate::peer::generate_peer_id(); // Generate new peer_id
 
-                    // Attempt to connect to the first peer
-                    match std::net::TcpStream::connect((peer.ip.as_str(), peer.port)) {
-                        Ok(mut stream) => {
-                            println!("Connected to peer {}:{}", peer.ip, peer.port);
+                    let mut connected = false;
+                    use rand::seq::SliceRandom;
+                    let mut rng = rand::rng();
+                    let mut peers = self.peers.clone();
+                    peers.shuffle(&mut rng); // ← SHUFFLE the peer list
 
-                            if crate::peer::perform_handshake(&mut stream, &info_hash, &peer_id)
-                                .is_ok()
-                                && crate::peer::send_interested(&mut stream).is_ok()
-                                && crate::peer::wait_for_unchoke(&mut stream).is_ok()
-                            {
-                                let piece_length = torrent.info.piece_length as u32; // Always safe to cast here
-                                match crate::peer::download_piece(&mut stream, 0, piece_length) {
-                                    Ok(piece_data) => {
-                                        if std::fs::write("piece_0.bin", &piece_data).is_ok() {
-                                            self.status_message =
-                                                "Piece 0 downloaded successfully.".to_string();
-                                            println!("Successfully downloaded and saved piece 0!");
-                                        } else {
-                                            self.status_message =
-                                                "Failed to save piece 0.".to_string();
-                                            eprintln!("Failed to save piece 0 to disk.");
+                    for peer in &peers {
+                        println!("Trying to connect to {}:{}", peer.ip, peer.port);
+                        match std::net::TcpStream::connect((peer.ip.as_str(), peer.port)) {
+                            Ok(mut stream) => {
+                                println!("Connected to peer {}:{}", peer.ip, peer.port);
+
+                                if crate::peer::perform_handshake(&mut stream, &info_hash, &peer_id)
+                                    .is_ok()
+                                    && crate::peer::send_interested(&mut stream).is_ok()
+                                    && crate::peer::wait_for_unchoke(&mut stream).is_ok()
+                                {
+                                    println!("Handshake, interested, and unchoke successful!");
+
+                                    let piece_length = torrent.info.piece_length as u32; // Always safe to cast here
+                                    match crate::peer::download_piece(&mut stream, 0, piece_length)
+                                    {
+                                        Ok(piece_data) => {
+                                            if std::fs::write("piece_0.bin", &piece_data).is_ok() {
+                                                self.status_message =
+                                                    "Piece 0 downloaded successfully.".to_string();
+                                                println!(
+                                                    "Successfully downloaded and saved piece 0!"
+                                                );
+                                            } else {
+                                                self.status_message =
+                                                    "Failed to save piece 0.".to_string();
+                                                eprintln!("Failed to save piece 0 to disk.");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to download piece: {}", e);
                                         }
                                     }
-                                    Err(e) => {
-                                        eprintln!("Failed to download piece: {}", e);
-                                    }
+                                    connected = true;
+                                    break; // Exit loop after success
+                                } else {
+                                    eprintln!(
+                                        "Handshake or interested/unchoke failed with this peer."
+                                    );
                                 }
-                            } else {
-                                eprintln!("Handshake or interested/unchoke failed.");
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to connect to peer: {}", e);
                             }
                         }
-                        Err(e) => {
-                            eprintln!("Failed to connect to peer: {}", e);
-                        }
+                    }
+                    if !connected {
+                        self.status_message = "Failed to download from any peer.".to_string();
+                        eprintln!("Failed to download from any peer.");
                     }
                 } else {
-                    eprintln!("No torrent loaded or no peers available!");
+                    eprintln!("No torrent loaded!");
                 }
             }
 

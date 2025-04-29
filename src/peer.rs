@@ -6,7 +6,7 @@ use std::time::Duration;
 
 // Generates peer id
 pub fn generate_peer_id() -> [u8; 20] {
-    let prefix = b"-MY0100-"; // refers to the client
+    let prefix = b"-UT3530-"; // refers to the client
     let mut peer_id = [0u8; 20]; // Fill first 8 bytes with prefix
 
     peer_id[..8].copy_from_slice(prefix);
@@ -42,7 +42,8 @@ pub fn perform_handshake(
 
     // reserved (8 bytes) - all zeroes for now
     // reserved for future protocol extensions
-    handshake.extend_from_slice(&[0; 8]);
+    // Sets extension protocol bit (extension handshake support)
+    handshake.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00]);
 
     // info_hash (20 bytes) <sha-1 hash is always 160 bits>
     // contains torrent's info dictionary
@@ -57,7 +58,10 @@ pub fn perform_handshake(
 
     // Read handshake response (68 bytes)
     let mut response = [0u8; 68];
-    stream.read_exact(&mut response)?;
+    if let Err(e) = stream.read_exact(&mut response) {
+        eprintln!("Failed to read handshake response: {}", e);
+        return Err(e);
+    }
 
     // Validate response
     if response[0] != 19 {
