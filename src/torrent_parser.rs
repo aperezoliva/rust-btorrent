@@ -27,9 +27,15 @@ pub struct Torrent {
     pub info: Info,
 }
 
+// Struct returned when parsing a .torrent file
+pub struct LoadedTorrent {
+    pub torrent: Torrent,
+    pub info_bytes: Vec<u8>,
+}
+
 // Gui state for the app
 pub struct TorrentApp {
-    torrent: Option<Torrent>,
+    loaded_torrent: Option<LoadedTorrent>,
     file_path: String,
     peers: Vec<PeerInfo>,
     status_message: String,
@@ -39,7 +45,7 @@ pub struct TorrentApp {
 impl Default for TorrentApp {
     fn default() -> Self {
         Self {
-            torrent: None,
+            loaded_torrent: None,
             file_path: "example.torrent".to_string(),
             peers: Vec::new(),
             status_message: String::new(),
@@ -55,29 +61,31 @@ impl eframe::App for TorrentApp {
             ui.label("Enter .torrent file path:");
             ui.text_edit_singleline(&mut self.file_path);
 
+            // Load Torrent Button
             if ui.button("Load Torrent").clicked() {
                 match parse_torrent_file(&self.file_path) {
-                    Ok(torrent) => {
-                        self.torrent = Some(torrent);
+                    Ok(loaded_torrent) => {
+                        self.loaded_torrent = Some(loaded_torrent);
                         self.peers.clear();
                         self.status_message = "Torrent loaded successfully.".to_string();
                     }
                     Err(e) => {
                         eprintln!("Failed to parse: {}", e);
                         self.status_message = format!("Failed to load torrent: {}", e);
-                        self.torrent = None;
+                        self.loaded_torrent = None;
                         self.peers.clear();
                     }
                 }
             }
-
-            // buttont to find peers, worked with .unwrap but appearently that's not really recommended in rust
+            // Find Peers Button
             if ui.button("Find Peers").clicked() {
-                if let Some(ref torrent) = self.torrent {
-                    let info_hash = compute_info_hash(&torrent.info);
+                if let Some(ref loaded_torrent) = self.loaded_torrent {
+                    let torrent = &loaded_torrent.torrent;
+                    let info_hash = compute_info_hash(&loaded_torrent.info_bytes);
                     let mut handles = Vec::new();
                     let peer_id = crate::peer::generate_peer_id(); // Single peer_id for all connections
-                                                                   // Try primary announce URL first
+
+                    // Try primary announce URL first
                     if let Some(ref announce_url) = torrent.announce {
                         let info_hash = info_hash.clone();
                         let announce_url = announce_url.clone();
@@ -155,7 +163,6 @@ impl eframe::App for TorrentApp {
                         }
                     }
                     self.peers = all_peers;
-
                     // Update status
                     if self.peers.is_empty() {
                         self.status_message = "No peers found.".to_string();
@@ -166,11 +173,13 @@ impl eframe::App for TorrentApp {
                     eprintln!("No torrent loaded!");
                 }
             }
-
+            // Download Piece 0 Button
             if ui.button("Download Piece 0").clicked() {
-                if let (Some(ref torrent), Some(peer)) = (self.torrent.as_ref(), self.peers.first())
+                if let (Some(ref loaded_torrent), Some(peer)) =
+                    (self.loaded_torrent.as_ref(), self.peers.first())
                 {
-                    let info_hash = compute_info_hash(&torrent.info);
+                    let torrent = &loaded_torrent.torrent;
+                    let info_hash = compute_info_hash(&loaded_torrent.info_bytes);
                     let peer_id = crate::peer::generate_peer_id(); // Generate new peer_id
 
                     // Attempt to connect to the first peer
@@ -192,7 +201,7 @@ impl eframe::App for TorrentApp {
                                             println!("Successfully downloaded and saved piece 0!");
                                         } else {
                                             self.status_message =
-                                                "Failed to download piece 0.".to_string();
+                                                "Failed to save piece 0.".to_string();
                                             eprintln!("Failed to save piece 0 to disk.");
                                         }
                                     }
@@ -212,9 +221,11 @@ impl eframe::App for TorrentApp {
                     eprintln!("No torrent loaded or no peers available!");
                 }
             }
-            // doesnt work for some reason, please delete this comment if it working
-            // PLEASE
-            if let Some(ref torrent) = self.torrent {
+
+            // Display torrent details if loaded
+            if let Some(ref loaded_torrent) = self.loaded_torrent {
+                let torrent = &loaded_torrent.torrent;
+
                 if let Some(ref announce_url) = torrent.announce {
                     ui.label(format!("Tracker URL: {}", announce_url));
                 } else {
@@ -269,18 +280,17 @@ fn print_bencode_tree(value: &Value, indent: usize) {
     }
 }
 
-// Compute the SHA-1 hash of the serialized 'info' dictionary for tracker and peer identification
-pub fn compute_info_hash(info: &Info) -> [u8; 20] {
-    let encoded_info = serde_bencode::to_bytes(info).expect("Failed to encode info dict");
+// Compute the SHA-1 hash of the serialized 'info' dictionary
+pub fn compute_info_hash(info_bytes: &[u8]) -> [u8; 20] {
     let mut hasher = Sha1::new();
-    hasher.update(encoded_info);
+    hasher.update(info_bytes);
     let result = hasher.finalize();
     result.into()
 }
 
 // Only loads the torrent file and parses it into a Torrent struct, doesn't contact tracker yet
-pub fn parse_torrent_file(path: &str) -> Result<Torrent, Box<dyn std::error::Error>> {
-    // Trim quotes around path just incase, this is unnecessary tbh
+pub fn parse_torrent_file(path: &str) -> Result<LoadedTorrent, Box<dyn std::error::Error>> {
+    // Trim quotes around path just in case, this is unnecessary tbh
     let path = path.trim_matches('"');
     println!("Trying to load file: {}", path);
 
@@ -291,18 +301,27 @@ pub fn parse_torrent_file(path: &str) -> Result<Torrent, Box<dyn std::error::Err
     }
 
     // Reads raw bytes and prints hex data
-    let data = fs::read(path)?;
+    let data = std::fs::read(path)?;
     println!("Raw data (hex): {:?}", hex::encode(&data));
 
-    // Try to decode bencode
-    // https://en.wikipedia.org/wiki/Bencode it's pronounced BEE-encode btw
-    match serde_bencode::from_bytes::<Value>(&data) {
-        Ok(decoded) => println!("Decoded Bencode: {:?}", decoded),
-        Err(e) => eprintln!("Failed to decode raw bencode: {}", e),
-    }
+    // Try to decode raw bencode
+    // https://en.wikipedia.org/wiki/Bencode (it's pronounced BEE-encode btw)
+    let decoded = serde_bencode::from_bytes::<Value>(&data)?;
 
-    // Deserialize decoded data into a Torrent struct
-    let mut torrent: Torrent = from_bytes(&data)?;
+    // Dig inside top-level dictionary to find the 'info' dictionary
+    let info_value = match &decoded {
+        Value::Dict(dict) => dict.get(&b"info"[..]).ok_or("Missing 'info' field")?,
+        _ => return Err("Torrent file is not a bencoded dictionary".into()),
+    };
+
+    // Re-serialize just the 'info' dictionary back into bencode
+    // Important: because tracker and peers expect EXACT same info_hash
+    let info_bytes = serde_bencode::to_bytes(info_value)?;
+
+    // Deserialize full .torrent file into Torrent struct
+    let torrent: Torrent = from_bytes(&data)?;
+
+    let mut torrent = torrent;
 
     // If announce field is missing, fallback to first HTTP tracker in announce-list
     if torrent.announce.is_none() {
@@ -327,11 +346,15 @@ pub fn parse_torrent_file(path: &str) -> Result<Torrent, Box<dyn std::error::Err
         return Err("No HTTP announce URL found in torrent file.".into());
     }
 
+    // Print a pretty debug tree of the decoded bencode structure
     if let Ok(decoded) = serde_bencode::from_bytes::<Value>(&data) {
         println!("Decoded Bencode Tree:");
         print_bencode_tree(&decoded, 0);
     }
 
-    // Return parsed torrent
-    Ok(torrent)
+    // Return both the parsed Torrent and the raw info dict bytes
+    Ok(LoadedTorrent {
+        torrent,
+        info_bytes,
+    })
 }
