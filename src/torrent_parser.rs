@@ -1,5 +1,6 @@
 // Libraries for decoding, file I/O, hashing, and communicating with a tracker
 // Also draws in from other files' functions
+use crate::file_ops::{cleanup_pieces, combine_pieces};
 use crate::tracker::PeerInfo;
 use serde::{Deserialize, Serialize};
 use serde_bencode::{from_bytes, value::Value};
@@ -220,6 +221,103 @@ impl eframe::App for TorrentApp {
                                     }
                                     connected = true;
                                     break; // Exit loop after success
+                                } else {
+                                    eprintln!(
+                                        "Handshake or interested/unchoke failed with this peer."
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to connect to peer: {}", e);
+                            }
+                        }
+                    }
+                    if !connected {
+                        self.status_message = "Failed to download from any peer.".to_string();
+                        eprintln!("Failed to download from any peer.");
+                    }
+                } else {
+                    eprintln!("No torrent loaded!");
+                }
+            }
+            // Download all pieces button
+            if ui.button("Download All Pieces").clicked() {
+                if let Some(ref loaded_torrent) = self.loaded_torrent {
+                    let torrent = &loaded_torrent.torrent;
+                    let info_hash = compute_info_hash(&loaded_torrent.info_bytes);
+                    let peer_id = crate::peer::generate_peer_id(); // Generate new peer_id
+                    let mut connected = false;
+                    use rand::seq::SliceRandom;
+                    let mut rng = rand::rng();
+                    let mut peers = self.peers.clone();
+                    peers.shuffle(&mut rng); // Shuffle the peer list
+                    for peer in &peers {
+                        println!("Trying to connect to {}:{}", peer.ip, peer.port);
+                        match std::net::TcpStream::connect((peer.ip.as_str(), peer.port)) {
+                            Ok(mut stream) => {
+                                println!("Connected to peer {}:{}", peer.ip, peer.port);
+                                if crate::peer::perform_handshake(&mut stream, &info_hash, &peer_id)
+                                    .is_ok()
+                                    && crate::peer::send_interested(&mut stream).is_ok()
+                                    && crate::peer::wait_for_unchoke(&mut stream).is_ok()
+                                {
+                                    println!("Handshake, interested, and unchoke successful!");
+
+                                    // Total file length
+                                    let total_length = torrent.info.length.unwrap_or(0);
+                                    let piece_length = torrent.info.piece_length as u32;
+                                    let num_pieces = (total_length + piece_length as u64 - 1)
+                                        / piece_length as u64;
+
+                                    println!("Total pieces: {}", num_pieces);
+
+                                    for piece_index in 0..num_pieces {
+                                        let expected_length = if piece_index == num_pieces - 1 {
+                                            // Last piece may be smaller
+                                            (total_length % piece_length as u64) as u32
+                                        } else {
+                                            piece_length
+                                        };
+
+                                        println!(
+                                            "Requesting piece {} ({} bytes)",
+                                            piece_index, expected_length
+                                        );
+
+                                        match crate::peer::download_piece(
+                                            &mut stream,
+                                            piece_index as u32,
+                                            expected_length,
+                                        ) {
+                                            Ok(piece_data) => {
+                                                let filename = format!("piece_{}.bin", piece_index);
+                                                if std::fs::write(&filename, &piece_data).is_ok() {
+                                                    println!("Saved {}", filename);
+                                                } else {
+                                                    eprintln!("Failed to save {}", filename);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "Failed to download piece {}: {}",
+                                                    piece_index, e
+                                                );
+                                                break; // Maybe move to another peer later
+                                            }
+                                        }
+                                    }
+                                    connected = true;
+                                    if combine_pieces("final_output.bin", num_pieces).is_ok() {
+                                        println!("Torrent fully assembled into final_output.bin!");
+                                        self.status_message =
+                                            "Torrent fully downloaded and assembled.".to_string();
+                                        if cleanup_pieces(num_pieces).is_ok() {
+                                            println!("Cleaned up piece files.");
+                                        } else {
+                                            eprintln!("Failed to clean up piece files.");
+                                        }
+                                    }
+                                    break; // Exit after downloading all pieces
                                 } else {
                                     eprintln!(
                                         "Handshake or interested/unchoke failed with this peer."
