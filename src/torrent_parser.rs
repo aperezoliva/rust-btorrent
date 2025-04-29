@@ -1,6 +1,5 @@
 // Libraries for decoding, file I/O, hashing, and communicating with a tracker
 // Also draws in from other files' functions
-use crate::peer;
 use crate::tracker::PeerInfo;
 use serde::{Deserialize, Serialize};
 use serde_bencode::{from_bytes, value::Value};
@@ -68,20 +67,25 @@ impl eframe::App for TorrentApp {
                 }
             }
 
+            // buttont to find peers, worked with .unwrap but appearently that's not really recommended in rust
             if ui.button("Find Peers").clicked() {
                 if let Some(ref torrent) = self.torrent {
-                    let info_hash = compute_info_hash(&torrent.info);
-                    match crate::tracker::contact_tracker(
-                        &torrent.announce,
-                        &info_hash,
-                        torrent.info.length.unwrap_or(0),
-                    ) {
-                        Ok(peers) => {
-                            self.peers = peers;
+                    if let Some(ref announce_url) = torrent.announce {
+                        let info_hash = compute_info_hash(&torrent.info);
+                        match crate::tracker::contact_tracker(
+                            announce_url,
+                            &info_hash,
+                            torrent.info.length.unwrap_or(0),
+                        ) {
+                            Ok(peers) => {
+                                self.peers = peers;
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to contact tracker: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("Failed to contact tracker: {}", e);
-                        }
+                    } else {
+                        eprintln!("No announce URL available, cannot contact tracker.");
                     }
                 }
             }
@@ -129,7 +133,12 @@ impl eframe::App for TorrentApp {
             // doesnt work for some reason, please delete this comment if it working
             // PLEASE
             if let Some(ref torrent) = self.torrent {
-                ui.label(format!("Announce URL: {}", torrent.announce));
+                if let Some(ref announce_url) = torrent.announce {
+                    ui.label(format!("Announce URL: {}", announce_url));
+                } else {
+                    ui.label("Announce URL: (None found)");
+                }
+
                 ui.label(format!("Name: {}", torrent.info.name));
                 if let Some(length) = torrent.info.length {
                     ui.label(format!("Length: {} bytes", length));

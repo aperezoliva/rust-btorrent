@@ -29,7 +29,7 @@ pub fn contact_tracker(
     if !announce_url.starts_with("http") {
         // Skipping non-HTTP trackers for now, will implement HTTPS and UDP ones later (when i feel like it)
         println!("Skipping non-HTTP tracker: {}", announce_url);
-        return Ok((Vec::new()));
+        return Ok(Vec::new());
     }
 
     // Constructs the full announce url
