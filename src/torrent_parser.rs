@@ -21,7 +21,10 @@ pub struct Info {
 // Main structure of a torrent file
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Torrent {
-    pub announce: String,
+    #[serde(default)]
+    pub announce: Option<String>, // Now optional, because modern torrents might not have it WTF
+    #[serde(rename = "announce-list", default)]
+    pub announce_list: Option<Vec<Vec<String>>>, // Nested list of tracker URLs
     pub info: Info,
 }
 
@@ -214,7 +217,27 @@ pub fn parse_torrent_file(path: &str) -> Result<Torrent, Box<dyn std::error::Err
     }
 
     // Deserialize decoded data into a Torrent struct
-    let torrent: Torrent = from_bytes(&data)?;
+    let mut torrent: Torrent = from_bytes(&data)?;
+
+    // If announce field is missing, try to fallback to first tracker in announce-list
+    if torrent.announce.is_none() {
+        if let Some(lists) = &torrent.announce_list {
+            if let Some(first_list) = lists.first() {
+                if let Some(first_tracker) = first_list.first() {
+                    torrent.announce = Some(first_tracker.clone());
+                    println!(
+                        "Using tracker from announce-list: {}",
+                        torrent.announce.as_ref().unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    // Final safety: still error if no tracker found
+    if torrent.announce.is_none() {
+        return Err("No announce URL found in torrent file.".into());
+    }
 
     if let Ok(decoded) = serde_bencode::from_bytes::<Value>(&data) {
         println!("Decoded Bencode Tree:");
