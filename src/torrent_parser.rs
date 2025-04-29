@@ -95,7 +95,7 @@ impl eframe::App for TorrentApp {
                     let info_hash = compute_info_hash(&loaded_torrent.info_bytes);
                     let mut handles = Vec::new();
                     let peer_id = crate::peer::generate_peer_id(); // Single peer_id for all connections
-
+                    println!("Computed info_hash: {:?}", hex::encode(info_hash));
                     // Try primary announce URL first
                     if let Some(ref announce_url) = torrent.announce {
                         let info_hash = info_hash.clone();

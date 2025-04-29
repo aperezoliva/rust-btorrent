@@ -87,7 +87,11 @@ pub fn perform_handshake(
             "Info hash mismatch",
         ));
     }
-
+    if let Err(e) = stream.read_exact(&mut response) {
+        eprintln!("Failed to read handshake response: {}", e);
+        return Err(e);
+    }
+    println!("Handshake response (raw): {:?}", &response);
     println!("Handshake successful with peer!");
 
     Ok(())
