@@ -1,8 +1,10 @@
 use rand::Rng;
+use reqwest::blocking::get;
 use serde_bencode::{from_bytes, value::Value};
 use std::net::UdpSocket;
 use std::thread::sleep;
 use std::time::Duration;
+use urlencoding::encode;
 // Basic peer info
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -216,4 +218,29 @@ pub fn contact_udp_tracker(
 
         return Ok(peers);
     }
+}
+
+pub fn contact_http_tracker(
+    tracker_url: &str,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    total_length: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let info_hash_encoded = percent_encode(info_hash);
+    let peer_id_encoded = percent_encode(peer_id);
+
+    let url = format!(
+        "{}?info_hash={}&peer_id={}&port=6881&uploaded=0&downloaded=0&left={}&compact=1&event=started",
+        tracker_url,
+        info_hash_encoded,
+        peer_id_encoded,
+        total_length
+    );
+
+    println!("Contacting tracker: {}", url);
+
+    let response = get(&url)?.bytes()?;
+    println!("Tracker Response: {:?}", response);
+
+    Ok(())
 }

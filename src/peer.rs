@@ -1,9 +1,14 @@
 // for generating random peer ids and handshake operations
+use crate::torrent_parser::{Info, Torrent};
 use rand::{distr::Alphanumeric, rngs::ThreadRng, Rng};
+use serde_bencode::de;
+use serde_bencode::from_bytes;
+use serde_bencode::value::Value;
+use sha1::Digest;
+use sha1::Sha1;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
-
 // Generates peer id
 pub fn generate_peer_id() -> [u8; 20] {
     let prefix = b"-UT3530-"; // refers to the client
@@ -265,4 +270,275 @@ pub fn download_piece(
     );
 
     Ok(piece_data)
+}
+
+pub fn download_one_block(stream: &mut TcpStream, piece_length: u32) -> io::Result<Vec<u8>> {
+    const STANDARD_BLOCK_SIZE: u32 = 16384; // 16 KB standard request size
+
+    let piece_index = 0;
+    let block_offset = 0;
+
+    if piece_length == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Piece length is zero — cannot request data.",
+        ));
+    }
+
+    let request_size = piece_length.min(STANDARD_BLOCK_SIZE); // Cap to piece size if needed
+
+    send_request(stream, piece_index, block_offset, request_size)?;
+
+    let (_piece_idx, _block_offset, block_data) = receive_piece(stream)?;
+
+    Ok(block_data)
+}
+
+pub fn send_extended_handshake(stream: &mut TcpStream) -> io::Result<(u8, u64)> {
+    // Build the Extended Handshake message
+    let mut payload = b"d1:md11:ut_metadatai1ee".to_vec(); // Bencoded dictionary: {"m":{"ut_metadata":1}}
+
+    let mut message = Vec::new();
+
+    // Length = payload length + 2 bytes (1 for message ID, 1 for extended ID)
+    let total_length = payload.len() as u32 + 2;
+    message.extend_from_slice(&total_length.to_be_bytes());
+
+    // Message ID 20 (extended message)
+    message.push(20);
+
+    // Extended message ID 0 (extended handshake)
+    message.push(0);
+
+    // Payload (bencoded dictionary)
+    message.extend_from_slice(&payload);
+
+    // Send it
+    stream.write_all(&message)?;
+    println!("Sent Extended Handshake.");
+
+    // Now read peer's Extended Handshake response
+    let mut length_buf = [0u8; 4];
+    stream.read_exact(&mut length_buf)?;
+    let length = u32::from_be_bytes(length_buf);
+
+    if length == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Peer closed connection after extended handshake.",
+        ));
+    }
+
+    let mut msg_id_buf = [0u8; 1];
+    stream.read_exact(&mut msg_id_buf)?;
+    let msg_id = msg_id_buf[0];
+
+    if msg_id != 20 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Expected extended message (20), got {}", msg_id),
+        ));
+    }
+
+    // Extended message type
+    let mut ext_type_buf = [0u8; 1];
+    stream.read_exact(&mut ext_type_buf)?;
+    let ext_type = ext_type_buf[0];
+
+    if ext_type != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Expected extended handshake (0), got {}", ext_type),
+        ));
+    }
+
+    // Remaining payload
+    let payload_len = length as usize - 2;
+    let mut payload_buf = vec![0u8; payload_len];
+    stream.read_exact(&mut payload_buf)?;
+
+    println!("Received Extended Handshake payload: {:?}", payload_buf);
+
+    // Parse the bencoded payload
+    let parsed: Value = de::from_bytes(&payload_buf).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to decode bencode: {}", e),
+        )
+    })?;
+
+    // Extract ut_metadata extension ID and metadata size
+    if let Value::Dict(root) = parsed {
+        let mut metadata_size: u64 = 0;
+        let mut ut_metadata_id: u8 = 0;
+
+        if let Some(Value::Dict(m_dict)) = root.get(&b"m"[..]) {
+            if let Some(Value::Int(id)) = m_dict.get(&b"ut_metadata"[..]) {
+                ut_metadata_id = *id as u8;
+            }
+        }
+
+        if let Some(Value::Int(size)) = root.get(&b"metadata_size"[..]) {
+            metadata_size = *size as u64;
+        }
+
+        if ut_metadata_id == 0 || metadata_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Peer did not provide ut_metadata extension or metadata size.",
+            ));
+        }
+
+        println!(
+            "Peer supports ut_metadata (id {}) with metadata_size {} bytes",
+            ut_metadata_id, metadata_size
+        );
+
+        Ok((ut_metadata_id, metadata_size))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Extended handshake payload not a dictionary",
+        ))
+    }
+}
+
+/// Request a specific metadata piece from a peer
+pub fn request_metadata_piece(
+    stream: &mut TcpStream,
+    ut_metadata_id: u8,
+    piece_index: u32,
+) -> io::Result<Vec<u8>> {
+    use serde_bencode::ser;
+
+    // Build request dictionary
+    let mut dict = std::collections::HashMap::new();
+    dict.insert(b"msg_type".to_vec(), Value::Int(0)); // 0 = request
+    dict.insert(b"piece".to_vec(), Value::Int(piece_index as i64));
+
+    let payload = ser::to_bytes(&Value::Dict(dict))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Bencode error: {}", e)))?;
+
+    // Full message = 1-byte message ID (20), 1-byte extended message ID (ut_metadata ID), then payload
+    let mut message = Vec::new();
+    let total_length = payload.len() as u32 + 2;
+    message.extend_from_slice(&total_length.to_be_bytes());
+    message.push(20); // Extended message
+    message.push(ut_metadata_id); // Specific extension ID
+    message.extend_from_slice(&payload);
+
+    // Send the metadata piece request
+    stream.write_all(&message)?;
+    println!("Requested metadata piece {}", piece_index);
+
+    // Read peer's response
+    let mut length_buf = [0u8; 4];
+    stream.read_exact(&mut length_buf)?;
+    let length = u32::from_be_bytes(length_buf);
+
+    let mut msg_id_buf = [0u8; 1];
+    stream.read_exact(&mut msg_id_buf)?;
+    if msg_id_buf[0] != 20 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Expected extended message (20), got {}", msg_id_buf[0]),
+        ));
+    }
+
+    let mut ext_id_buf = [0u8; 1];
+    stream.read_exact(&mut ext_id_buf)?;
+    if ext_id_buf[0] != ut_metadata_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Expected ut_metadata extended message ID ({}), got {}",
+                ut_metadata_id, ext_id_buf[0]
+            ),
+        ));
+    }
+
+    // Remaining payload
+    let payload_len = length as usize - 2;
+    let mut payload_buf = vec![0u8; payload_len];
+    stream.read_exact(&mut payload_buf)?;
+
+    // Split metadata headers and actual block
+    // The payload looks like: {headers-dict}raw-metadata
+    // We need to find where headers end
+    let split_at = payload_buf
+        .windows(2)
+        .position(|w| w == b"ee")
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Failed to find end of bencode headers",
+            )
+        })?;
+
+    let metadata_start = split_at + 2; // after the "ee"
+    let metadata = payload_buf[metadata_start..].to_vec();
+
+    println!(
+        "Received metadata piece {} ({} bytes)",
+        piece_index,
+        metadata.len()
+    );
+
+    Ok(metadata)
+}
+
+/// Downloads the full metadata by requesting all metadata pieces
+pub fn download_metadata(
+    stream: &mut TcpStream,
+    ut_metadata_id: u8,
+    metadata_size: u64,
+) -> io::Result<Vec<u8>> {
+    const METADATA_BLOCK_SIZE: u64 = 16384;
+
+    let num_pieces = (metadata_size + METADATA_BLOCK_SIZE - 1) / METADATA_BLOCK_SIZE;
+    println!(
+        "Downloading metadata: {} bytes across {} pieces",
+        metadata_size, num_pieces
+    );
+
+    let mut full_metadata = Vec::with_capacity(metadata_size as usize);
+
+    for piece_index in 0..num_pieces {
+        println!("Requesting metadata piece {}", piece_index);
+
+        let piece_data = request_metadata_piece(stream, ut_metadata_id, piece_index as u32)?;
+
+        full_metadata.extend_from_slice(&piece_data);
+    }
+
+    // Safety check: trim if we downloaded slightly too much
+    if full_metadata.len() > metadata_size as usize {
+        full_metadata.truncate(metadata_size as usize);
+    }
+
+    println!(
+        "Finished downloading full metadata ({} bytes)",
+        full_metadata.len()
+    );
+
+    Ok(full_metadata)
+}
+
+pub fn compute_info_hash(metadata: &[u8]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(metadata);
+    let result = hasher.finalize();
+    result.into()
+}
+
+fn parse_metadata(metadata: &[u8]) -> Result<Torrent, Box<dyn std::error::Error>> {
+    let info: Info = from_bytes(metadata)?;
+
+    let torrent = Torrent {
+        announce: None,      // No announce URL from metadata
+        announce_list: None, // No announce-list either
+        info,
+    };
+
+    Ok(torrent)
 }

@@ -1,20 +1,29 @@
-// Libraries for decoding, file I/O, hashing, and communicating with a tracker
-// Also draws in from other files' functions
-use crate::file_ops::{cleanup_pieces, combine_pieces};
 use crate::tracker::PeerInfo;
+use egui::ProgressBar;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_bencode::{from_bytes, value::Value};
 use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
 
 // Struct representing the 'info' dictionary usually supplied by a torrent file
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Info {
     pub name: String,
-    pub length: Option<u64>,
+    pub length: Option<u64>, // single file
+    #[serde(default)]
+    pub files: Option<Vec<FileEntry>>, // multi-file
     #[serde(default)]
     pub piece_length: u64,
     pub pieces: ByteBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub length: u64,
+    pub path: Vec<String>,
 }
 
 // Main structure of a torrent file
@@ -39,6 +48,7 @@ pub struct TorrentApp {
     file_path: String,
     peers: Vec<PeerInfo>,
     status_message: String,
+    progress: f32,
 }
 
 // Default initialization for the app (empty torrent, default file path, no peers)
@@ -49,6 +59,7 @@ impl Default for TorrentApp {
             file_path: "example.torrent".to_string(),
             peers: Vec::new(),
             status_message: String::new(),
+            progress: 0.0,
         }
     }
 }
@@ -177,164 +188,33 @@ impl eframe::App for TorrentApp {
             if ui.button("Download Piece 0").clicked() {
                 if let Some(ref loaded_torrent) = self.loaded_torrent {
                     let torrent = &loaded_torrent.torrent;
-                    let info_hash = compute_info_hash(&loaded_torrent.info_bytes);
-                    let peer_id = crate::peer::generate_peer_id(); // Generate new peer_id
+                    let info_bytes = &loaded_torrent.info_bytes;
 
-                    let mut connected = false;
-                    use rand::seq::SliceRandom;
-                    let mut rng = rand::rng();
-                    let mut peers = self.peers.clone();
-                    peers.shuffle(&mut rng); // ← SHUFFLE the peer list
-
-                    for peer in &peers {
-                        println!("Trying to connect to {}:{}", peer.ip, peer.port);
-                        match std::net::TcpStream::connect((peer.ip.as_str(), peer.port)) {
-                            Ok(mut stream) => {
-                                println!("Connected to peer {}:{}", peer.ip, peer.port);
-
-                                if crate::peer::perform_handshake(&mut stream, &info_hash, &peer_id)
-                                    .is_ok()
-                                    && crate::peer::send_interested(&mut stream).is_ok()
-                                    && crate::peer::wait_for_unchoke(&mut stream).is_ok()
-                                {
-                                    println!("Handshake, interested, and unchoke successful!");
-
-                                    let piece_length = torrent.info.piece_length as u32; // Always safe to cast here
-                                    match crate::peer::download_piece(&mut stream, 0, piece_length)
-                                    {
-                                        Ok(piece_data) => {
-                                            if std::fs::write("piece_0.bin", &piece_data).is_ok() {
-                                                self.status_message =
-                                                    "Piece 0 downloaded successfully.".to_string();
-                                                println!(
-                                                    "Successfully downloaded and saved piece 0!"
-                                                );
-                                            } else {
-                                                self.status_message =
-                                                    "Failed to save piece 0.".to_string();
-                                                eprintln!("Failed to save piece 0 to disk.");
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Failed to download piece: {}", e);
-                                        }
-                                    }
-                                    connected = true;
-                                    break; // Exit loop after success
-                                } else {
-                                    eprintln!(
-                                        "Handshake or interested/unchoke failed with this peer."
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to connect to peer: {}", e);
-                            }
+                    match download_pieces(&self.peers, torrent, info_bytes, Some(0)) {
+                        Ok(_) => {
+                            self.status_message = "Piece 0 downloaded successfully.".to_string();
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Failed to download piece 0: {}", e);
                         }
                     }
-                    if !connected {
-                        self.status_message = "Failed to download from any peer.".to_string();
-                        eprintln!("Failed to download from any peer.");
-                    }
-                } else {
-                    eprintln!("No torrent loaded!");
                 }
             }
+
             // Download all pieces button
             if ui.button("Download All Pieces").clicked() {
                 if let Some(ref loaded_torrent) = self.loaded_torrent {
                     let torrent = &loaded_torrent.torrent;
-                    let info_hash = compute_info_hash(&loaded_torrent.info_bytes);
-                    let peer_id = crate::peer::generate_peer_id(); // Generate new peer_id
-                    let mut connected = false;
-                    use rand::seq::SliceRandom;
-                    let mut rng = rand::rng();
-                    let mut peers = self.peers.clone();
-                    peers.shuffle(&mut rng); // Shuffle the peer list
-                    for peer in &peers {
-                        println!("Trying to connect to {}:{}", peer.ip, peer.port);
-                        match std::net::TcpStream::connect((peer.ip.as_str(), peer.port)) {
-                            Ok(mut stream) => {
-                                println!("Connected to peer {}:{}", peer.ip, peer.port);
-                                if crate::peer::perform_handshake(&mut stream, &info_hash, &peer_id)
-                                    .is_ok()
-                                    && crate::peer::send_interested(&mut stream).is_ok()
-                                    && crate::peer::wait_for_unchoke(&mut stream).is_ok()
-                                {
-                                    println!("Handshake, interested, and unchoke successful!");
+                    let info_bytes = &loaded_torrent.info_bytes;
 
-                                    // Total file length
-                                    let total_length = torrent.info.length.unwrap_or(0);
-                                    let piece_length = torrent.info.piece_length as u32;
-                                    let num_pieces = (total_length + piece_length as u64 - 1)
-                                        / piece_length as u64;
-
-                                    println!("Total pieces: {}", num_pieces);
-
-                                    for piece_index in 0..num_pieces {
-                                        let expected_length = if piece_index == num_pieces - 1 {
-                                            // Last piece may be smaller
-                                            (total_length % piece_length as u64) as u32
-                                        } else {
-                                            piece_length
-                                        };
-
-                                        println!(
-                                            "Requesting piece {} ({} bytes)",
-                                            piece_index, expected_length
-                                        );
-
-                                        match crate::peer::download_piece(
-                                            &mut stream,
-                                            piece_index as u32,
-                                            expected_length,
-                                        ) {
-                                            Ok(piece_data) => {
-                                                let filename = format!("piece_{}.bin", piece_index);
-                                                if std::fs::write(&filename, &piece_data).is_ok() {
-                                                    println!("Saved {}", filename);
-                                                } else {
-                                                    eprintln!("Failed to save {}", filename);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "Failed to download piece {}: {}",
-                                                    piece_index, e
-                                                );
-                                                break; // Maybe move to another peer later
-                                            }
-                                        }
-                                    }
-                                    connected = true;
-                                    if combine_pieces("final_output.bin", num_pieces).is_ok() {
-                                        println!("Torrent fully assembled into final_output.bin!");
-                                        self.status_message =
-                                            "Torrent fully downloaded and assembled.".to_string();
-                                        if cleanup_pieces(num_pieces).is_ok() {
-                                            println!("Cleaned up piece files.");
-                                        } else {
-                                            eprintln!("Failed to clean up piece files.");
-                                        }
-                                    }
-                                    break; // Exit after downloading all pieces
-                                } else {
-                                    eprintln!(
-                                        "Handshake or interested/unchoke failed with this peer."
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to connect to peer: {}", e);
-                            }
+                    match download_pieces(&self.peers, torrent, info_bytes, None) {
+                        Ok(_) => {
+                            self.status_message = "All pieces downloaded successfully.".to_string();
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Failed to download all pieces: {}", e);
                         }
                     }
-                    if !connected {
-                        self.status_message = "Failed to download from any peer.".to_string();
-                        eprintln!("Failed to download from any peer.");
-                    }
-                } else {
-                    eprintln!("No torrent loaded!");
                 }
             }
 
@@ -357,6 +237,9 @@ impl eframe::App for TorrentApp {
             }
             ui.separator();
             ui.label(format!("Status: {}", self.status_message));
+
+            ui.label("Download Progress:");
+            ui.add(ProgressBar::new(self.progress).show_percentage());
         });
     }
 }
@@ -473,4 +356,130 @@ pub fn parse_torrent_file(path: &str) -> Result<LoadedTorrent, Box<dyn std::erro
         torrent,
         info_bytes,
     })
+}
+
+pub fn download_pieces(
+    peers: &[PeerInfo],
+    torrent: &Torrent,
+    info_bytes: &[u8],
+    piece_index: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rand::seq::SliceRandom;
+    let mut rng = rand::rng();
+    let mut peers = peers.to_vec();
+    peers.shuffle(&mut rng);
+
+    let info_hash = compute_info_hash(info_bytes);
+    let peer_id = crate::peer::generate_peer_id(); // Generate new peer_id
+
+    for peer in &peers {
+        println!("Trying to connect to {}:{}", peer.ip, peer.port);
+
+        match std::net::TcpStream::connect((peer.ip.as_str(), peer.port)) {
+            Ok(mut stream) => {
+                println!("Connected to peer {}:{}", peer.ip, peer.port);
+
+                if crate::peer::perform_handshake(&mut stream, &info_hash, &peer_id).is_ok()
+                    && crate::peer::send_interested(&mut stream).is_ok()
+                    && crate::peer::wait_for_unchoke(&mut stream).is_ok()
+                {
+                    println!("Handshake, interested, and unchoke successful!");
+
+                    let total_length = torrent.info.length.unwrap_or(0);
+                    let piece_length = torrent.info.piece_length as u32;
+
+                    if piece_length == 0 {
+                        return Err("Invalid torrent: piece length is zero.".into());
+                    }
+
+                    let num_pieces = (total_length + piece_length as u64 - 1) / piece_length as u64;
+
+                    let mut output = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .open("final_output.bin")?;
+
+                    match piece_index {
+                        Some(single_piece) => {
+                            let expected_length = if num_pieces == 1 {
+                                total_length as u32
+                            } else {
+                                piece_length
+                            };
+
+                            println!(
+                                "Requesting piece {} ({} bytes)",
+                                single_piece, expected_length
+                            );
+
+                            match crate::peer::download_piece(
+                                &mut stream,
+                                single_piece,
+                                expected_length,
+                            ) {
+                                Ok(piece_data) => {
+                                    let offset = (single_piece as u64) * piece_length as u64;
+                                    output.seek(SeekFrom::Start(offset))?;
+                                    output.write_all(&piece_data)?;
+                                    println!(
+                                        "Wrote piece {} directly into output file",
+                                        single_piece
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to download piece {}: {}", single_piece, e);
+                                    continue; // Try next peer
+                                }
+                            }
+                        }
+                        None => {
+                            for piece_idx in 0..num_pieces {
+                                let expected_length = if piece_idx == num_pieces - 1 {
+                                    let remaining = (total_length % piece_length as u64) as u32;
+                                    if remaining == 0 {
+                                        piece_length
+                                    } else {
+                                        remaining
+                                    }
+                                } else {
+                                    piece_length
+                                };
+
+                                println!(
+                                    "Requesting piece {} ({} bytes)",
+                                    piece_idx, expected_length
+                                );
+
+                                match crate::peer::download_piece(
+                                    &mut stream,
+                                    piece_idx as u32,
+                                    expected_length,
+                                ) {
+                                    Ok(piece_data) => {
+                                        let offset = piece_idx * piece_length as u64;
+                                        output.seek(SeekFrom::Start(offset))?;
+                                        output.write_all(&piece_data)?;
+                                        println!("Wrote piece {} into output", piece_idx);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to download piece {}: {}", piece_idx, e);
+                                        break; // Try another peer maybe
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    return Ok(());
+                } else {
+                    eprintln!("Handshake or interested/unchoke failed with this peer.");
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to connect to peer: {}", e);
+            }
+        }
+    }
+
+    Err("Failed to download from any peer.".into())
 }
