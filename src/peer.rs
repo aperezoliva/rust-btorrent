@@ -53,9 +53,12 @@ pub fn write_metadata_to_file(metadata: &[u8]) -> std::io::Result<String> {
     Ok(path.to_string())
 }
 
-pub fn launch_aria2c_with_torrent(torrent_path: &str) -> std::io::Result<()> {
+pub fn launch_aria2c_with_torrent_in_dir(
+    torrent_path: &str,
+    output_dir: &str,
+) -> std::io::Result<()> {
     let status = Command::new("aria2c")
-        .arg("--dir=/home/sharkbait/Downloads/aria2c/")
+        .arg(format!("--dir={}", output_dir))
         .arg("--seed-time=0")
         .arg(torrent_path)
         .status()?;
@@ -69,6 +72,7 @@ pub fn launch_aria2c_with_torrent(torrent_path: &str) -> std::io::Result<()> {
 
     Ok(())
 }
+
 // Generates peer id
 pub fn generate_peer_id() -> [u8; 20] {
     let prefix = b"-TR3000-"; // refers to the client
@@ -151,6 +155,7 @@ pub fn peer_loop(
     torrent: &Torrent,
     info_bytes: &[u8],
     piece_index: Option<u32>,
+    download_dir: &str,
 ) -> io::Result<()> {
     perform_handshake(stream, info_hash, peer_id)?;
     send_interested(stream)?;

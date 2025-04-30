@@ -1,5 +1,4 @@
 use crate::tracker::PeerInfo;
-use egui::ProgressBar;
 use serde::{Deserialize, Serialize};
 use serde_bencode::{from_bytes, value::Value};
 use serde_bytes::ByteBuf;
@@ -43,9 +42,9 @@ pub struct LoadedTorrent {
 pub struct TorrentApp {
     loaded_torrent: Option<LoadedTorrent>,
     file_path: String,
+    download_dir: Option<String>,
     peers: Vec<PeerInfo>,
     status_message: String,
-    progress: f32,
 }
 
 // Default initialization for the app (empty torrent, default file path, no peers)
@@ -54,9 +53,9 @@ impl Default for TorrentApp {
         Self {
             loaded_torrent: None,
             file_path: "example.torrent".to_string(),
+            download_dir: None, // ← Initialize here
             peers: Vec::new(),
             status_message: String::new(),
-            progress: 0.0,
         }
     }
 }
@@ -68,6 +67,23 @@ impl eframe::App for TorrentApp {
             ui.heading("Torrent Parser");
             ui.label("Enter .torrent file path:");
             ui.text_edit_singleline(&mut self.file_path);
+            if ui.button("Select Download Folder").clicked() {
+                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                    self.download_dir = Some(folder.display().to_string());
+                    println!(
+                        "Selected download folder: {}",
+                        self.download_dir.as_ref().unwrap()
+                    );
+                }
+            }
+            if ui.button("Browse .torrent file").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Torrent", &["torrent"])
+                    .pick_file()
+                {
+                    self.file_path = path.display().to_string();
+                }
+            }
 
             if ui.button("Load Torrent").clicked() {
                 match parse_torrent_file(&self.file_path) {
@@ -174,7 +190,15 @@ impl eframe::App for TorrentApp {
                 .clicked()
             {
                 if let Some(ref _loaded_torrent) = self.loaded_torrent {
-                    match crate::peer::launch_aria2c_with_torrent(&self.file_path) {
+                    let output_dir = self
+                        .download_dir
+                        .clone()
+                        .unwrap_or_else(|| "downloads".to_string());
+
+                    match crate::peer::launch_aria2c_with_torrent_in_dir(
+                        &self.file_path,
+                        &output_dir,
+                    ) {
                         Ok(_) => {
                             self.status_message = "aria2c started successfully.".to_string();
                         }
@@ -186,13 +210,17 @@ impl eframe::App for TorrentApp {
             }
 
             if ui
-                .button("Download Pieces with personal protocol")
+                .button("Download Pieces with personal protocol (not properly functioning)")
                 .clicked()
             {
                 if let Some(ref loaded_torrent) = self.loaded_torrent {
                     let torrent = &loaded_torrent.torrent;
                     let info_bytes = &loaded_torrent.info_bytes;
-                    match download_pieces(&self.peers, torrent, info_bytes, None) {
+                    let dir = self
+                        .download_dir
+                        .clone()
+                        .unwrap_or_else(|| "downloads".to_string());
+                    match download_pieces(&self.peers, torrent, info_bytes, None, &dir) {
                         Ok(_) => {
                             self.status_message = "All pieces downloaded successfully.".to_string()
                         }
@@ -219,45 +247,43 @@ impl eframe::App for TorrentApp {
             }
             ui.separator();
             ui.label(format!("Status: {}", self.status_message));
-            ui.label("Download Progress:");
-            ui.add(ProgressBar::new(self.progress).show_percentage());
         });
     }
 }
 // Bencode data gets printed recursively for debugging purposes, might comment out since it's slowing
 // The terminal (i think)
-fn print_bencode_tree(value: &Value, indent: usize) {
-    let pad = " ".repeat(indent);
-    match value {
-        Value::Int(i) => println!("{}Int: {}", pad, i),
-        Value::Bytes(bytes) => {
-            if let Ok(s) = std::str::from_utf8(bytes) {
-                println!("{}Bytes: {:?}", pad, s);
-            } else {
-                println!("{}Bytes: ({} bytes)", pad, bytes.len());
-            }
-        }
-        Value::List(list) => {
-            println!("{}List [", pad);
-            for item in list {
-                print_bencode_tree(item, indent + 2);
-            }
-            println!("{}]", pad);
-        }
-        Value::Dict(dict) => {
-            println!("{}Dict {{", pad);
-            for (key, val) in dict {
-                let key_display = match std::str::from_utf8(key) {
-                    Ok(s) => format!("{:?}", s),
-                    Err(_) => format!("(binary key: {} bytes)", key.len()),
-                };
-                println!("{}  Key: {}", pad, key_display);
-                print_bencode_tree(val, indent + 4);
-            }
-            println!("{}}}", pad);
-        }
-    }
-}
+// fn print_bencode_tree(value: &Value, indent: usize) {
+//     let pad = " ".repeat(indent);
+//     match value {
+//         Value::Int(i) => println!("{}Int: {}", pad, i),
+//         Value::Bytes(bytes) => {
+//             if let Ok(s) = std::str::from_utf8(bytes) {
+//                 println!("{}Bytes: {:?}", pad, s);
+//             } else {
+//                 println!("{}Bytes: ({} bytes)", pad, bytes.len());
+//             }
+//         }
+//         Value::List(list) => {
+//             println!("{}List [", pad);
+//             for item in list {
+//                 print_bencode_tree(item, indent + 2);
+//             }
+//             println!("{}]", pad);
+//         }
+//         Value::Dict(dict) => {
+//             println!("{}Dict {{", pad);
+//             for (key, val) in dict {
+//                 let key_display = match std::str::from_utf8(key) {
+//                     Ok(s) => format!("{:?}", s),
+//                     Err(_) => format!("(binary key: {} bytes)", key.len()),
+//                 };
+//                 println!("{}  Key: {}", pad, key_display);
+//                 print_bencode_tree(val, indent + 4);
+//             }
+//             println!("{}}}", pad);
+//         }
+//     }
+// }
 
 // Compute the SHA-1 hash of the serialized 'info' dictionary
 pub fn compute_info_hash(info_bytes: &[u8]) -> [u8; 20] {
@@ -278,8 +304,7 @@ pub fn parse_torrent_file(path: &str) -> Result<LoadedTorrent, Box<dyn std::erro
 
     let data = std::fs::read(path)?;
     let root: Value = serde_bencode::from_bytes(&data)?;
-    let decoded = serde_bencode::from_bytes::<Value>(&data)?;
-    let info_value = match &decoded {
+    let info_value = match &root {
         Value::Dict(dict) => dict.get(&b"info"[..]).ok_or("Missing 'info' field")?,
         _ => return Err("Torrent file is not a bencoded dictionary".into()),
     };
@@ -351,6 +376,7 @@ pub fn download_pieces(
     torrent: &Torrent,
     info_bytes: &[u8],
     piece_index: Option<u32>,
+    download_dir: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use rand::seq::SliceRandom;
     let mut rng = rand::rng();
@@ -377,6 +403,7 @@ pub fn download_pieces(
                     torrent,
                     info_bytes,
                     piece_index,
+                    download_dir,
                 ) {
                     Ok(_) => {
                         println!("Download completed successfully from peer.");
@@ -402,7 +429,8 @@ pub fn download_pieces(
 
     eprintln!("All peer attempts failed. Falling back to aria2c...");
     let path = crate::peer::write_metadata_to_file(info_bytes)?;
-    crate::peer::launch_aria2c_with_torrent(&path)?;
+    let output_dir = "downloads";
+    crate::peer::launch_aria2c_with_torrent_in_dir(&path, output_dir)?;
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
