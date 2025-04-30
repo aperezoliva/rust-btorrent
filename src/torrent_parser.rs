@@ -6,6 +6,7 @@ use serde_bencode::{from_bytes, value::Value};
 use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
 use std::fs::OpenOptions;
+use std::io;
 
 // Struct representing the 'info' dictionary usually supplied by a torrent file
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -296,7 +297,11 @@ pub fn parse_torrent_file(path: &str) -> Result<LoadedTorrent, Box<dyn std::erro
     let info_bytes = serde_bencode::to_bytes(info_value)?;
 
     // Deserialize full .torrent file into Torrent struct
-    let torrent: Torrent = from_bytes(&data)?;
+    let mut torrent: Torrent = from_bytes(&data)?;
+
+    // Parse and overwrite the info field manually to ensure full correctness
+    let info: Info = from_bytes(&info_bytes)?;
+    torrent.info = info;
 
     let mut torrent = torrent;
 
@@ -343,13 +348,20 @@ pub fn download_pieces(
     piece_index: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use rand::seq::SliceRandom;
-
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut shuffled_peers = peers.to_vec();
     shuffled_peers.shuffle(&mut rng);
 
     let info_hash = compute_info_hash(info_bytes);
     let peer_id = crate::peer::generate_peer_id();
+
+    // If torrent is missing metadata, attempt to recover it from peers
+    if torrent.info.piece_length == 0 {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Loaded .torrent file has invalid piece_length = 0",
+        )));
+    }
 
     for peer in &shuffled_peers {
         println!("Trying to connect to {}:{}", peer.ip, peer.port);
