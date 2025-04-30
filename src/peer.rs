@@ -8,10 +8,11 @@ use sha1::Digest;
 use sha1::Sha1;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
 // Generates peer id
 pub fn generate_peer_id() -> [u8; 20] {
-    let prefix = b"-UT3530-"; // refers to the client
+    let prefix = b"-TR3000-"; // refers to the client
     let mut peer_id = [0u8; 20]; // Fill first 8 bytes with prefix
 
     peer_id[..8].copy_from_slice(prefix);
@@ -128,109 +129,116 @@ pub fn decode_bitfield(payload: &[u8]) -> Vec<u32> {
 
 // Unchoke refers to peers allowing the client to download pieces
 /* Implemented some new changes per https://stackoverflow.com/questions/53531493/peers-not-sending-back-unchoke-message */
-pub fn wait_for_unchoke(stream: &mut TcpStream) -> io::Result<PeerState> {
-    use std::io::ErrorKind;
-    use std::time::{Duration, Instant};
+const CHOKE: u8 = 0;
+const UNCHOKE: u8 = 1;
+const INTERESTED: u8 = 2;
+const NOT_INTERESTED: u8 = 3;
+const HAVE: u8 = 4;
+const BITFIELD: u8 = 5;
+const REQUEST: u8 = 6;
+const PIECE: u8 = 7;
+const CANCEL: u8 = 8;
+const PORT: u8 = 9;
+
+pub fn wait_until_unchoked(stream: &mut std::net::TcpStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let start = Instant::now();
 
     let mut length_buf = [0u8; 4];
     let mut id_buf = [0u8; 1];
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-
-    let start = Instant::now();
 
     loop {
         if start.elapsed().as_secs() > 60 {
-            println!("Timeout reached while waiting for unchoke."); // Chatgpt suggested block to set a timeout for unchoke, modified to allow for longer wait time
-            return Ok(PeerState::NotUnchoked);
+            stream.write_all(&[0, 0, 0, 0])?;
+            println!("Sent keep-alive");
         }
 
+        // Read the length prefix
         match stream.read_exact(&mut length_buf) {
-            Ok(_) => (),
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => continue,
+            Ok(_) => {}
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             Err(e) => return Err(e),
         }
 
         let length = u32::from_be_bytes(length_buf);
-
         if length == 0 {
-            println!("Received keep-alive message.");
+            println!("Received keep-alive");
             continue;
         }
-
         if length > 2_000_000 {
-            // Received a message with an implausibly large declared length.
-            // Rather than panic, skip this data and continue listening.
-            eprintln!(
-                "Ignoring absurd message length from peer: {} bytes. Skipping.",
-                length
-            );
-
-            let mut skipped = 0;
-            let mut buffer = [0u8; 4096];
-            while skipped < length as usize {
-                let read_len = std::cmp::min(buffer.len(), length as usize - skipped);
-                match stream.read(&mut buffer[..read_len]) {
-                    Ok(0) => break, // Peer closed connection
-                    Ok(n) => skipped += n,
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(100));
-                        continue;
-                    }
-                    Err(e) => break,
-                }
-            }
-            continue;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Peer sent absurd message length: {}", length),
+            ));
         }
 
+        // Read the message ID
         match stream.read_exact(&mut id_buf) {
-            Ok(_) => (),
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => continue,
+            Ok(_) => {}
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             Err(e) => return Err(e),
         }
 
         let message_id = id_buf[0];
+        let payload_len = length as usize - 1;
 
-        if message_id == 1 {
-            println!("✅ Received unchoke from peer!");
-            return Ok(PeerState::Unchoked);
-        } else if message_id == 5 {
-            let mut bitfield = vec![0u8; length as usize - 1];
-            stream.read_exact(&mut bitfield)?;
-            let pieces = decode_bitfield(&bitfield);
-            println!("Peer bitfield: {:?} pieces available", pieces);
-            continue;
-        } else {
-            println!(
-                "Received message ID {} ({} bytes). Waiting for unchoke...",
-                message_id, length
-            );
+        println!("Received message ID {} ({} bytes)", message_id, length);
+        match message_id {
+            0 => println!("Keep-alive (0)"),
+            1 => println!("Unchoke (1)"),
+            2 => println!("Interested (2)"),
+            3 => println!("Not Interested (3)"),
+            4 => println!("Have (4)"),
+            5 => println!("Bitfield (5)"),
+            6 => println!("Request (6)"),
+            7 => println!("Piece (7)"),
+            8 => println!("Cancel (8)"),
+            20 => println!("Extended Message (20)"),
+            other => println!("Unknown message ID {}", other),
+        }
 
-            let to_skip = length as usize - 1;
-            let mut skipped = 0;
-            let mut buffer = [0u8; 4096];
-
-            while skipped < to_skip {
-                let read_len = std::cmp::min(buffer.len(), to_skip - skipped);
-                match stream.read(&mut buffer[..read_len]) {
-                    Ok(0) => {
-                        return Err(io::Error::new(
-                            ErrorKind::UnexpectedEof,
-                            "Peer closed connection mid-message",
-                        ));
-                    }
-                    Ok(n) => skipped += n,
-                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                        eprintln!("Socket temporarily unavailable while skipping. Retrying...");
-                        std::thread::sleep(Duration::from_millis(100));
-                        continue;
-                    }
-                    Err(e) => {
-                        return Err(io::Error::new(
-                            ErrorKind::Other,
-                            format!("Failed to skip message payload: {}", e),
-                        ));
-                    }
+        // Handle specific messages
+        match message_id {
+            UNCHOKE => {
+                println!("Peer unchoked us. Proceeding to download.");
+                return Ok(());
+            }
+            CHOKE => {
+                println!("Peer choked us.");
+            }
+            HAVE => {
+                let mut have_buf = [0u8; 4];
+                match stream.read_exact(&mut have_buf) {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e),
                 }
+                let index = u32::from_be_bytes(have_buf);
+                println!("Peer has piece {}", index);
+            }
+            BITFIELD => {
+                let mut bitfield = vec![0u8; payload_len];
+                stream.read_exact(&mut bitfield)?;
+                println!("Received bitfield ({} bytes)", bitfield.len());
+            }
+            PIECE => {
+                println!("Received piece message (but skipping payload)");
+                let mut skip_buf = vec![0u8; payload_len];
+                stream.read_exact(&mut skip_buf)?;
+            }
+            _ => {
+                println!(
+                    "Unhandled message {}, skipping {} bytes",
+                    message_id, payload_len
+                );
+                let mut skip_buf = vec![0u8; payload_len];
+                stream.read_exact(&mut skip_buf)?;
             }
         }
     }

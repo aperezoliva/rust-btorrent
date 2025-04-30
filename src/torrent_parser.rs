@@ -73,7 +73,6 @@ impl eframe::App for TorrentApp {
             ui.label("Enter .torrent file path:");
             ui.text_edit_singleline(&mut self.file_path);
 
-            // Load Torrent Button
             if ui.button("Load Torrent").clicked() {
                 match parse_torrent_file(&self.file_path) {
                     Ok(loaded_torrent) => {
@@ -89,27 +88,21 @@ impl eframe::App for TorrentApp {
                     }
                 }
             }
-            // Find Peers Button
+
             if ui.button("Find Peers").clicked() {
                 if let Some(ref loaded_torrent) = self.loaded_torrent {
                     let torrent = &loaded_torrent.torrent;
                     let info_hash = compute_info_hash(&loaded_torrent.info_bytes);
                     let mut handles = Vec::new();
-                    let peer_id = crate::peer::generate_peer_id(); // Single peer_id for all connections
+                    let peer_id = crate::peer::generate_peer_id();
 
-                    // Try primary announce URL first
                     if let Some(ref announce_url) = torrent.announce {
                         let info_hash = info_hash.clone();
                         let announce_url = announce_url.clone();
                         let peer_id = peer_id.clone();
                         handles.push(std::thread::spawn(move || {
                             if announce_url.starts_with("http") {
-                                crate::tracker::contact_tracker(
-                                    &announce_url,
-                                    &info_hash,
-                                    0, // Dummy filesize for now
-                                )
-                                .ok()
+                                crate::tracker::contact_tracker(&announce_url, &info_hash, 0).ok()
                             } else if announce_url.starts_with("udp") {
                                 crate::tracker::contact_udp_tracker(
                                     &announce_url,
@@ -128,22 +121,17 @@ impl eframe::App for TorrentApp {
                             }
                         }));
                     }
-                    // Try all trackers in announce-list
+
                     if let Some(ref announce_list) = torrent.announce_list {
                         for tracker_list in announce_list {
                             for tracker_url in tracker_list {
                                 let tracker_url = tracker_url.clone();
                                 let info_hash = info_hash.clone();
                                 let peer_id = peer_id.clone();
-
                                 handles.push(std::thread::spawn(move || {
                                     if tracker_url.starts_with("http") {
-                                        crate::tracker::contact_tracker(
-                                            &tracker_url,
-                                            &info_hash,
-                                            0, // Dummy filesize
-                                        )
-                                        .ok()
+                                        crate::tracker::contact_tracker(&tracker_url, &info_hash, 0)
+                                            .ok()
                                     } else if tracker_url.starts_with("udp") {
                                         crate::tracker::contact_udp_tracker(
                                             &tracker_url,
@@ -167,7 +155,7 @@ impl eframe::App for TorrentApp {
                             }
                         }
                     }
-                    // Collect results
+
                     let mut all_peers = Vec::new();
                     for handle in handles {
                         if let Ok(Some(peers)) = handle.join() {
@@ -175,60 +163,53 @@ impl eframe::App for TorrentApp {
                         }
                     }
                     self.peers = all_peers;
-                    // Update status
-                    if self.peers.is_empty() {
-                        self.status_message = "No peers found.".to_string();
+                    self.status_message = if self.peers.is_empty() {
+                        "No peers found.".to_string()
                     } else {
-                        self.status_message = format!("Found {} peers.", self.peers.len());
-                    }
+                        format!("Found {} peers.", self.peers.len())
+                    };
                 } else {
                     eprintln!("No torrent loaded!");
                 }
             }
-            // Download Piece 0 Button
+
             if ui.button("Download Piece 0").clicked() {
                 if let Some(ref loaded_torrent) = self.loaded_torrent {
                     let torrent = &loaded_torrent.torrent;
                     let info_bytes = &loaded_torrent.info_bytes;
-
                     match download_pieces(&self.peers, torrent, info_bytes, Some(0)) {
                         Ok(_) => {
-                            self.status_message = "Piece 0 downloaded successfully.".to_string();
+                            self.status_message = "Piece 0 downloaded successfully.".to_string()
                         }
                         Err(e) => {
-                            self.status_message = format!("Failed to download piece 0: {}", e);
+                            self.status_message = format!("Failed to download piece 0: {}", e)
                         }
                     }
                 }
             }
 
-            // Download all pieces button
             if ui.button("Download All Pieces").clicked() {
                 if let Some(ref loaded_torrent) = self.loaded_torrent {
                     let torrent = &loaded_torrent.torrent;
                     let info_bytes = &loaded_torrent.info_bytes;
-
                     match download_pieces(&self.peers, torrent, info_bytes, None) {
                         Ok(_) => {
-                            self.status_message = "All pieces downloaded successfully.".to_string();
+                            self.status_message = "All pieces downloaded successfully.".to_string()
                         }
                         Err(e) => {
-                            self.status_message = format!("Failed to download all pieces: {}", e);
+                            self.status_message = format!("Failed to download all pieces: {}", e)
                         }
                     }
                 }
             }
 
-            // Display torrent details if loaded
             if let Some(ref loaded_torrent) = self.loaded_torrent {
                 let torrent = &loaded_torrent.torrent;
-
                 if let Some(ref announce_url) = torrent.announce {
                     ui.label(format!("Tracker URL: {}", announce_url));
                 } else {
                     ui.label("Tracker URL: (None found)");
                 }
-
                 ui.label(format!("Name: {}", torrent.info.name));
                 if let Some(length) = torrent.info.length {
                     ui.label(format!("Length: {} bytes", length));
@@ -238,13 +219,11 @@ impl eframe::App for TorrentApp {
             }
             ui.separator();
             ui.label(format!("Status: {}", self.status_message));
-
             ui.label("Download Progress:");
             ui.add(ProgressBar::new(self.progress).show_percentage());
         });
     }
 }
-
 // Bencode data gets printed recursively for debugging purposes, might comment out since it's slowing
 // The terminal (i think)
 fn print_bencode_tree(value: &Value, indent: usize) {
@@ -382,13 +361,16 @@ pub fn download_pieces(
 
                 if crate::peer::perform_handshake(&mut stream, &info_hash, &peer_id).is_ok()
                     && crate::peer::send_interested(&mut stream).is_ok()
-                    && matches!(
-                        crate::peer::wait_for_unchoke(&mut stream)?,
-                        crate::peer::PeerState::Unchoked
-                    )
+                    && crate::peer::wait_until_unchoked(&mut stream).is_ok()
                 {
                     println!("Handshake, interested, and unchoke successful!");
-
+                    let have_msg = [
+                        0u8, 0, 0, 5, // length = 5
+                        4, // message ID = 'have'
+                        0, 0, 0, 0, // piece index = 0
+                    ];
+                    stream.write_all(&have_msg)?;
+                    println!("Sent fake 'have' message for piece 0");
                     let total_length = torrent.info.length.unwrap_or(0);
                     let piece_length = torrent.info.piece_length as u32;
 
