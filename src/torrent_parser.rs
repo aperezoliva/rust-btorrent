@@ -383,9 +383,23 @@ pub fn download_pieces(
                                     crate::peer::download_metadata(&mut stream, ext_id, size)
                                 })
                                 .and_then(|metadata| {
-                                    let parsed = crate::peer::parse_metadata(&metadata)?;
-                                    let length = parsed.info.length.ok_or("Missing file length")?;
-                                    Ok((parsed, length, parsed.info.piece_length, metadata))
+                                    let parsed =
+                                        crate::peer::parse_metadata(&metadata).map_err(|e| {
+                                            std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                e.to_string(),
+                                            )
+                                        })?;
+                                    let piece_len = parsed.info.piece_length;
+                                    let length = parsed.info.length.ok_or_else(|| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "Missing file length",
+                                        )
+                                    })?;
+
+                                    // Clone parsed only once here
+                                    Ok((parsed.clone(), length, piece_len, metadata))
                                 }) {
                                 Ok((t, l, p, b)) => (t, l, p, b),
                                 Err(e) => {
