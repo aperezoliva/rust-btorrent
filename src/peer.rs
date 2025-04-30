@@ -67,11 +67,26 @@ pub fn perform_handshake(
 
     // Read handshake response (68 bytes)
     let mut response = [0u8; 68];
-    if let Err(e) = stream.read_exact(&mut response) {
-        eprintln!("Failed to read handshake response: {}", e);
-        return Err(e);
+    let mut total_read = 0;
+    while total_read < 68 {
+        match stream.read(&mut response[total_read..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "Peer closed connection during handshake (read {} bytes)",
+                        total_read
+                    ),
+                ));
+            }
+            Ok(n) => total_read += n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
-
     // Validate response
     if response[0] != 19 {
         return Err(io::Error::new(
@@ -90,10 +105,6 @@ pub fn perform_handshake(
             io::ErrorKind::InvalidData,
             "Info hash mismatch",
         ));
-    }
-    if let Err(e) = stream.read_exact(&mut response) {
-        eprintln!("Failed to read handshake response: {}", e);
-        return Err(e);
     }
     println!("Handshake response (raw): {:?}", &response);
     println!("Handshake successful with peer!");
@@ -141,22 +152,47 @@ const CANCEL: u8 = 8;
 const PORT: u8 = 9;
 
 pub fn wait_until_unchoked(stream: &mut std::net::TcpStream) -> io::Result<()> {
+    use std::io::ErrorKind;
+    use std::time::{Duration, Instant};
+
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let start = Instant::now();
+    let mut last_sent = Instant::now();
+
+    // Send fake "have" message (pretend we have piece 0)
+    let have_msg = [0u8, 0, 0, 5, 4, 0, 0, 0, 0]; // length=5, ID=4, piece=0
+    stream.write_all(&have_msg)?;
+    println!("Sent fake 'have' message for piece 0");
+
+    // Send fake bitfield (pretend we have 64 pieces — adjust as needed)
+    let fake_bitfield = vec![0xFF; 8]; // 8 bytes = 64 bits
+    let bitfield_len = fake_bitfield.len() + 1;
+    stream.write_all(&(bitfield_len as u32).to_be_bytes())?;
+    stream.write_all(&[5])?;
+    stream.write_all(&fake_bitfield)?;
+    println!("Sent fake bitfield");
 
     let mut length_buf = [0u8; 4];
     let mut id_buf = [0u8; 1];
 
     loop {
         if start.elapsed().as_secs() > 60 {
-            stream.write_all(&[0, 0, 0, 0])?;
-            println!("Sent keep-alive");
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                "Timed out waiting for unchoke",
+            ));
         }
 
-        // Read the length prefix
+        // Periodic keep-alive every 25 seconds
+        if last_sent.elapsed().as_secs() >= 25 {
+            stream.write_all(&[0, 0, 0, 0])?;
+            println!("Sent keep-alive");
+            last_sent = Instant::now();
+        }
+
         match stream.read_exact(&mut length_buf) {
             Ok(_) => {}
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
@@ -170,18 +206,14 @@ pub fn wait_until_unchoked(stream: &mut std::net::TcpStream) -> io::Result<()> {
         }
         if length > 2_000_000 {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+                ErrorKind::InvalidData,
                 format!("Peer sent absurd message length: {}", length),
             ));
         }
 
-        // Read the message ID
         match stream.read_exact(&mut id_buf) {
             Ok(_) => {}
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),
         }
 
@@ -191,43 +223,25 @@ pub fn wait_until_unchoked(stream: &mut std::net::TcpStream) -> io::Result<()> {
         println!("Received message ID {} ({} bytes)", message_id, length);
         match message_id {
             0 => println!("Keep-alive (0)"),
-            1 => println!("Unchoke (1)"),
-            2 => println!("Interested (2)"),
-            3 => println!("Not Interested (3)"),
-            4 => println!("Have (4)"),
-            5 => println!("Bitfield (5)"),
-            6 => println!("Request (6)"),
-            7 => println!("Piece (7)"),
-            8 => println!("Cancel (8)"),
-            20 => println!("Extended Message (20)"),
-            other => println!("Unknown message ID {}", other),
-        }
-
-        // Handle specific messages
-        match message_id {
-            UNCHOKE => {
+            1 => {
+                println!("Unchoke (1)");
                 println!("Peer unchoked us. Proceeding to download.");
                 return Ok(());
             }
-            CHOKE => {
-                println!("Peer choked us.");
-            }
-            HAVE => {
+            2 => println!("Interested (2)"),
+            3 => println!("Not Interested (3)"),
+            4 => {
                 let mut have_buf = [0u8; 4];
-                match stream.read_exact(&mut have_buf) {
-                    Ok(_) => {}
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                    Err(e) => return Err(e),
-                }
+                stream.read_exact(&mut have_buf)?;
                 let index = u32::from_be_bytes(have_buf);
                 println!("Peer has piece {}", index);
             }
-            BITFIELD => {
+            5 => {
                 let mut bitfield = vec![0u8; payload_len];
                 stream.read_exact(&mut bitfield)?;
                 println!("Received bitfield ({} bytes)", bitfield.len());
             }
-            PIECE => {
+            7 => {
                 println!("Received piece message (but skipping payload)");
                 let mut skip_buf = vec![0u8; payload_len];
                 stream.read_exact(&mut skip_buf)?;
@@ -280,44 +294,53 @@ pub fn send_request(
 // Receives a 'piece' message from the peer, returns the piece data as Vec<u8>
 pub fn receive_piece(stream: &mut TcpStream) -> io::Result<(u32, u32, Vec<u8>)> {
     let mut length_buf = [0u8; 4];
-    let mut id_buf = [0u8; 1];
-
-    // Read 4-byte length prefix
     stream.read_exact(&mut length_buf)?;
     let length = u32::from_be_bytes(length_buf);
 
     if length < 9 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Piece message too short",
+            format!("Piece message too short: {} bytes", length),
         ));
     }
 
-    // Read 1-byte message ID
-    stream.read_exact(&mut id_buf)?;
-    let message_id = id_buf[0];
+    let mut header_buf = [0u8; 9]; // 1 byte message_id + 4 index + 4 offset
+    stream.read_exact(&mut header_buf)?;
+    let message_id = header_buf[0];
 
     if message_id != 7 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Expected Piece (7), got {}", message_id),
+            format!("Expected Piece (7), got message ID {}", message_id),
         ));
     }
 
-    // Read 4-byte piece index
-    let mut piece_index_buf = [0u8; 4];
-    stream.read_exact(&mut piece_index_buf)?;
-    let piece_index = u32::from_be_bytes(piece_index_buf);
+    let piece_index = u32::from_be_bytes(header_buf[1..5].try_into().unwrap());
+    let block_offset = u32::from_be_bytes(header_buf[5..9].try_into().unwrap());
 
-    // Read 4-byte block offset
-    let mut block_offset_buf = [0u8; 4];
-    stream.read_exact(&mut block_offset_buf)?;
-    let block_offset = u32::from_be_bytes(block_offset_buf);
+    let block_len = length as usize - 9;
+    let mut block_data = vec![0u8; block_len];
+    let mut total_read = 0;
 
-    // Remaining bytes = actual block data
-    let block_length = length - 9;
-    let mut block_data = vec![0u8; block_length as usize];
-    stream.read_exact(&mut block_data)?;
+    while total_read < block_len {
+        match stream.read(&mut block_data[total_read..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "Peer closed connection after reading {} of {} bytes",
+                        total_read, block_len
+                    ),
+                ));
+            }
+            Ok(n) => total_read += n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
     println!(
         "Received piece index {}, offset {}, length {}",
@@ -395,111 +418,120 @@ pub fn download_one_block(stream: &mut TcpStream, piece_length: u32) -> io::Resu
 }
 
 pub fn send_extended_handshake(stream: &mut TcpStream) -> io::Result<(u8, u64)> {
-    // Build the Extended Handshake message
-    let mut payload = b"d1:md11:ut_metadatai1ee".to_vec(); // Bencoded dictionary: {"m":{"ut_metadata":1}}
+    use serde_bencode::de;
 
+    let mut payload = b"d1:md11:ut_metadatai1ee".to_vec(); // {"m": {"ut_metadata": 1}}
     let mut message = Vec::new();
-
-    // Length = payload length + 2 bytes (1 for message ID, 1 for extended ID)
     let total_length = payload.len() as u32 + 2;
     message.extend_from_slice(&total_length.to_be_bytes());
-
-    // Message ID 20 (extended message)
-    message.push(20);
-
-    // Extended message ID 0 (extended handshake)
-    message.push(0);
-
-    // Payload (bencoded dictionary)
+    message.push(20); // extended message
+    message.push(0); // extended handshake
     message.extend_from_slice(&payload);
-
-    // Send it
     stream.write_all(&message)?;
     println!("Sent Extended Handshake.");
 
-    // Now read peer's Extended Handshake response
     let mut length_buf = [0u8; 4];
-    stream.read_exact(&mut length_buf)?;
-    let length = u32::from_be_bytes(length_buf);
-
-    if length == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "Peer closed connection after extended handshake.",
-        ));
-    }
-
     let mut msg_id_buf = [0u8; 1];
-    stream.read_exact(&mut msg_id_buf)?;
-    let msg_id = msg_id_buf[0];
-
-    if msg_id != 20 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Expected extended message (20), got {}", msg_id),
-        ));
-    }
-
-    // Extended message type
     let mut ext_type_buf = [0u8; 1];
-    stream.read_exact(&mut ext_type_buf)?;
-    let ext_type = ext_type_buf[0];
 
-    if ext_type != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Expected extended handshake (0), got {}", ext_type),
-        ));
-    }
+    let start = std::time::Instant::now();
 
-    // Remaining payload
-    let payload_len = length as usize - 2;
-    let mut payload_buf = vec![0u8; payload_len];
-    stream.read_exact(&mut payload_buf)?;
-
-    println!("Received Extended Handshake payload: {:?}", payload_buf);
-
-    // Parse the bencoded payload
-    let parsed: Value = de::from_bytes(&payload_buf).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Failed to decode bencode: {}", e),
-        )
-    })?;
-
-    // Extract ut_metadata extension ID and metadata size
-    if let Value::Dict(root) = parsed {
-        let mut metadata_size: u64 = 0;
-        let mut ut_metadata_id: u8 = 0;
-
-        if let Some(Value::Dict(m_dict)) = root.get(&b"m"[..]) {
-            if let Some(Value::Int(id)) = m_dict.get(&b"ut_metadata"[..]) {
-                ut_metadata_id = *id as u8;
-            }
-        }
-
-        if let Some(Value::Int(size)) = root.get(&b"metadata_size"[..]) {
-            metadata_size = *size as u64;
-        }
-
-        if ut_metadata_id == 0 || metadata_size == 0 {
+    loop {
+        if start.elapsed().as_secs() > 10 {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Peer did not provide ut_metadata extension or metadata size.",
+                io::ErrorKind::TimedOut,
+                "Timed out waiting for extended handshake response",
             ));
         }
 
-        println!(
-            "Peer supports ut_metadata (id {}) with metadata_size {} bytes",
-            ut_metadata_id, metadata_size
-        );
+        // Read length prefix
+        stream.read_exact(&mut length_buf)?;
+        let length = u32::from_be_bytes(length_buf);
 
-        Ok((ut_metadata_id, metadata_size))
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Extended handshake payload not a dictionary",
-        ))
+        if length == 0 {
+            println!("Received keep-alive during extended handshake.");
+            continue;
+        }
+        if length < 2 {
+            println!(
+                "Skipping short message during extended handshake: length={}",
+                length
+            );
+            let mut skip_buf = vec![0u8; length as usize];
+            stream.read_exact(&mut skip_buf)?;
+            continue;
+        }
+
+        // Read message ID and extended message ID
+        stream.read_exact(&mut msg_id_buf)?;
+        stream.read_exact(&mut ext_type_buf)?;
+        let msg_id = msg_id_buf[0];
+        let ext_type = ext_type_buf[0];
+
+        if msg_id != 20 {
+            let mut skip_buf = vec![0u8; (length as usize) - 1];
+            stream.read_exact(&mut skip_buf)?;
+            println!("Skipping non-extension message ID {}", msg_id);
+            continue;
+        }
+
+        if ext_type != 0 {
+            // Not the extended handshake we're looking for — skip payload
+            let mut skip_buf = vec![0u8; (length as usize) - 2];
+            stream.read_exact(&mut skip_buf)?;
+            println!(
+                "Skipping non-handshake extension message (ext_id = {})",
+                ext_type
+            );
+            continue;
+        }
+
+        // This is the extended handshake payload we want
+        let payload_len = (length as usize) - 2;
+        let mut payload_buf = vec![0u8; payload_len];
+        stream.read_exact(&mut payload_buf)?;
+
+        println!("Received Extended Handshake payload: {:?}", payload_buf);
+
+        // Decode it
+        let parsed: Value = de::from_bytes(&payload_buf).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to decode bencode: {}", e),
+            )
+        })?;
+
+        if let Value::Dict(root) = parsed {
+            let mut ut_metadata_id = 0u8;
+            let mut metadata_size = 0u64;
+
+            if let Some(Value::Dict(m)) = root.get(&b"m"[..]) {
+                if let Some(Value::Int(id)) = m.get(&b"ut_metadata"[..]) {
+                    ut_metadata_id = *id as u8;
+                }
+            }
+            if let Some(Value::Int(size)) = root.get(&b"metadata_size"[..]) {
+                metadata_size = *size as u64;
+            }
+
+            if ut_metadata_id == 0 || metadata_size == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Peer did not advertise ut_metadata or metadata_size",
+                ));
+            }
+
+            println!(
+                "Peer supports ut_metadata (id {}) with metadata_size {} bytes",
+                ut_metadata_id, metadata_size
+            );
+            return Ok((ut_metadata_id, metadata_size));
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Extended handshake payload was not a dictionary",
+            ));
+        }
     }
 }
 
@@ -509,84 +541,109 @@ pub fn request_metadata_piece(
     ut_metadata_id: u8,
     piece_index: u32,
 ) -> io::Result<Vec<u8>> {
-    use serde_bencode::ser;
+    use serde_bencode::value::Value;
+    use serde_bencode::{de, ser};
 
-    // Build request dictionary
+    // Build bencoded request: { "msg_type": 0, "piece": piece_index }
     let mut dict = std::collections::HashMap::new();
-    dict.insert(b"msg_type".to_vec(), Value::Int(0)); // 0 = request
+    dict.insert(b"msg_type".to_vec(), Value::Int(0));
     dict.insert(b"piece".to_vec(), Value::Int(piece_index as i64));
+    let payload = ser::to_bytes(&Value::Dict(dict)).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to encode bencode: {}", e),
+        )
+    })?;
 
-    let payload = ser::to_bytes(&Value::Dict(dict))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Bencode error: {}", e)))?;
-
-    // Full message = 1-byte message ID (20), 1-byte extended message ID (ut_metadata ID), then payload
-    let mut message = Vec::new();
+    // Send: [len][id=20][ext_id][payload]
+    let mut message = Vec::with_capacity(payload.len() + 2 + 4);
     let total_length = payload.len() as u32 + 2;
     message.extend_from_slice(&total_length.to_be_bytes());
-    message.push(20); // Extended message
-    message.push(ut_metadata_id); // Specific extension ID
+    message.push(20);
+    message.push(ut_metadata_id);
     message.extend_from_slice(&payload);
-
-    // Send the metadata piece request
     stream.write_all(&message)?;
     println!("Requested metadata piece {}", piece_index);
 
-    // Read peer's response
-    let mut length_buf = [0u8; 4];
-    stream.read_exact(&mut length_buf)?;
-    let length = u32::from_be_bytes(length_buf);
+    // Receive and loop until matching metadata piece response
+    loop {
+        // Read header
+        let mut length_buf = [0u8; 4];
+        stream.read_exact(&mut length_buf)?;
+        let length = u32::from_be_bytes(length_buf);
+        if length < 2 {
+            let mut skip = vec![0u8; length as usize];
+            stream.read_exact(&mut skip)?;
+            println!("Skipping short or malformed extended message.");
+            continue;
+        }
 
-    let mut msg_id_buf = [0u8; 1];
-    stream.read_exact(&mut msg_id_buf)?;
-    if msg_id_buf[0] != 20 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Expected extended message (20), got {}", msg_id_buf[0]),
-        ));
+        let mut msg_id_buf = [0u8; 1];
+        stream.read_exact(&mut msg_id_buf)?;
+        if msg_id_buf[0] != 20 {
+            let mut skip = vec![0u8; length as usize - 1];
+            stream.read_exact(&mut skip)?;
+            println!(
+                "Received non-extended message (ID {}). Skipping.",
+                msg_id_buf[0]
+            );
+            continue;
+        }
+
+        let mut ext_id_buf = [0u8; 1];
+        stream.read_exact(&mut ext_id_buf)?;
+        if ext_id_buf[0] != ut_metadata_id {
+            let mut skip = vec![0u8; length as usize - 2];
+            stream.read_exact(&mut skip)?;
+            println!(
+                "Unexpected extended message ID ({}). Expected {}. Skipping.",
+                ext_id_buf[0], ut_metadata_id
+            );
+            continue;
+        }
+
+        let payload_len = length as usize - 2;
+        let mut payload_buf = vec![0u8; payload_len];
+        stream.read_exact(&mut payload_buf)?;
+
+        // Split the payload: {bencoded header} + raw metadata
+        if let Some(split_at) = payload_buf.windows(2).position(|w| w == b"ee") {
+            let header_bytes = &payload_buf[..split_at + 2];
+            let metadata_bytes = &payload_buf[split_at + 2..];
+
+            let header_val: Value = de::from_bytes(header_bytes).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to decode metadata piece header: {}", e),
+                )
+            })?;
+
+            if let Value::Dict(dict) = header_val {
+                if let Some(Value::Int(msg_type)) = dict.get(&b"msg_type"[..]) {
+                    if *msg_type == 1 {
+                        println!(
+                            "Received metadata piece {} ({} bytes)",
+                            piece_index,
+                            metadata_bytes.len()
+                        );
+                        return Ok(metadata_bytes.to_vec());
+                    } else {
+                        println!("Received unexpected msg_type: {}. Ignoring.", msg_type);
+                    }
+                } else {
+                    println!("Header missing msg_type field");
+                }
+            } else {
+                println!("Header is not a dictionary");
+            }
+        } else {
+            println!("Could not find 'ee' marker in extended metadata piece");
+        }
+
+        // No valid metadata, try next message
+        println!("Retrying to receive correct metadata piece...");
     }
-
-    let mut ext_id_buf = [0u8; 1];
-    stream.read_exact(&mut ext_id_buf)?;
-    if ext_id_buf[0] != ut_metadata_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Expected ut_metadata extended message ID ({}), got {}",
-                ut_metadata_id, ext_id_buf[0]
-            ),
-        ));
-    }
-
-    // Remaining payload
-    let payload_len = length as usize - 2;
-    let mut payload_buf = vec![0u8; payload_len];
-    stream.read_exact(&mut payload_buf)?;
-
-    // Split metadata headers and actual block
-    // The payload looks like: {headers-dict}raw-metadata
-    // We need to find where headers end
-    let split_at = payload_buf
-        .windows(2)
-        .position(|w| w == b"ee")
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Failed to find end of bencode headers",
-            )
-        })?;
-
-    let metadata_start = split_at + 2; // after the "ee"
-    let metadata = payload_buf[metadata_start..].to_vec();
-
-    println!(
-        "Received metadata piece {} ({} bytes)",
-        piece_index,
-        metadata.len()
-    );
-
-    Ok(metadata)
 }
-
 /// Downloads the full metadata by requesting all metadata pieces
 pub fn download_metadata(
     stream: &mut TcpStream,
@@ -631,16 +688,20 @@ pub fn compute_info_hash(metadata: &[u8]) -> [u8; 20] {
     result.into()
 }
 
-fn parse_metadata(metadata: &[u8]) -> Result<Torrent, Box<dyn std::error::Error>> {
+pub fn parse_metadata(metadata: &[u8]) -> Result<Torrent, Box<dyn std::error::Error>> {
     let info_value: Info = from_bytes(metadata)?;
 
-    let torrent = Torrent {
-        announce: None,      // No announce URL from metadata
-        announce_list: None, // No announce-list either
-        info: info_value,
-    };
+    // Validate required fields
+    if info_value.piece_length == 0 {
+        return Err("Parsed metadata missing valid piece length".into());
+    }
 
-    Ok(torrent)
+    // Return full Torrent struct with only the announce/announce-list omitted (as expected)
+    Ok(Torrent {
+        announce: None,
+        announce_list: None,
+        info: info_value,
+    })
 }
 
 /// Reads and interprets a bitfield message from a peer.

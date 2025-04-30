@@ -10,7 +10,7 @@ use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 
 // Struct representing the 'info' dictionary usually supplied by a torrent file
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Info {
     pub name: String,
     pub length: Option<u64>, // single file
@@ -21,14 +21,14 @@ pub struct Info {
     pub pieces: ByteBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileEntry {
     pub length: u64,
     pub path: Vec<String>,
 }
 
 // Main structure of a torrent file
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Torrent {
     #[serde(default)]
     pub announce: Option<String>, // Now optional, because modern torrents might not have it WTF
@@ -345,51 +345,77 @@ pub fn download_pieces(
     piece_index: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use rand::seq::SliceRandom;
-    let mut rng = rand::rng();
-    let mut peers = peers.to_vec();
-    peers.shuffle(&mut rng);
+    use std::io::{Seek, SeekFrom, Write};
 
-    let info_hash = compute_info_hash(info_bytes);
-    let peer_id = crate::peer::generate_peer_id(); // Generate new peer_id
+    let mut rng = rand::thread_rng();
+    let mut shuffled_peers = peers.to_vec();
+    shuffled_peers.shuffle(&mut rng);
 
-    for peer in &peers {
+    let original_info_hash = compute_info_hash(info_bytes);
+    let peer_id = crate::peer::generate_peer_id();
+
+    for peer in &shuffled_peers {
         println!("Trying to connect to {}:{}", peer.ip, peer.port);
-
         match std::net::TcpStream::connect((peer.ip.as_str(), peer.port)) {
             Ok(mut stream) => {
                 println!("Connected to peer {}:{}", peer.ip, peer.port);
 
-                if crate::peer::perform_handshake(&mut stream, &info_hash, &peer_id).is_ok()
+                if crate::peer::perform_handshake(&mut stream, &original_info_hash, &peer_id)
+                    .is_ok()
                     && crate::peer::send_interested(&mut stream).is_ok()
                     && crate::peer::wait_until_unchoked(&mut stream).is_ok()
                 {
                     println!("Handshake, interested, and unchoke successful!");
-                    let have_msg = [
-                        0u8, 0, 0, 5, // length = 5
-                        4, // message ID = 'have'
-                        0, 0, 0, 0, // piece index = 0
-                    ];
-                    stream.write_all(&have_msg)?;
-                    println!("Sent fake 'have' message for piece 0");
-                    let total_length = torrent.info.length.unwrap_or(0);
-                    let piece_length = torrent.info.piece_length as u32;
 
-                    if piece_length == 0 {
+                    // Send fake 'have' and bitfield to trigger optimistic unchoke behavior
+                    let _ = stream.write_all(&[0, 0, 0, 5, 4, 0, 0, 0, 0]);
+                    println!("Sent fake 'have' message for piece 0");
+                    let _ = stream.write_all(&[0, 0, 0, 2, 5, 0]); // empty bitfield
+                    println!("Sent fake bitfield");
+
+                    let (resolved_torrent, total_len, piece_len, resolved_info_bytes) =
+                        if torrent.info.piece_length == 0 {
+                            println!(
+                            "Torrent file is missing piece length. Attempting metadata exchange..."
+                        );
+                            match crate::peer::send_extended_handshake(&mut stream)
+                                .and_then(|(ext_id, size)| {
+                                    crate::peer::download_metadata(&mut stream, ext_id, size)
+                                })
+                                .and_then(|metadata| {
+                                    let parsed = crate::peer::parse_metadata(&metadata)?;
+                                    let length = parsed.info.length.ok_or("Missing file length")?;
+                                    Ok((parsed, length, parsed.info.piece_length, metadata))
+                                }) {
+                                Ok((t, l, p, b)) => (t, l, p, b),
+                                Err(e) => {
+                                    eprintln!("Metadata fetch failed: {e}");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            (
+                                torrent.clone(),
+                                torrent.info.length.unwrap_or(0),
+                                torrent.info.piece_length,
+                                info_bytes.to_vec(),
+                            )
+                        };
+
+                    if piece_len == 0 {
                         return Err("Invalid torrent: piece length is zero.".into());
                     }
 
-                    let num_pieces = (total_length + piece_length as u64 - 1) / piece_length as u64;
-                    let num_pieces = num_pieces as usize;
+                    let piece_len = piece_len as u32;
+                    let num_pieces =
+                        ((total_len + piece_len as u64 - 1) / piece_len as u64) as usize;
 
                     if let Ok(bitfield) = read_bitfield(&mut stream, num_pieces) {
                         println!(
                             "Bitfield received: peer has {} pieces",
                             bitfield.iter().filter(|&&b| b).count()
                         );
-                    } else {
-                        println!("Peer didn't send a bitfield or message was malformed.");
                     }
-                    let num_pieces = (total_length + piece_length as u64 - 1) / piece_length as u64;
 
                     let mut output = OpenOptions::new()
                         .create(true)
@@ -398,69 +424,55 @@ pub fn download_pieces(
 
                     match piece_index {
                         Some(single_piece) => {
-                            let expected_length = if num_pieces == 1 {
-                                total_length as u32
+                            let expected_len = if num_pieces == 1 {
+                                total_len as u32
                             } else {
-                                piece_length
+                                piece_len
                             };
-
-                            println!(
-                                "Requesting piece {} ({} bytes)",
-                                single_piece, expected_length
-                            );
-
                             match crate::peer::download_piece(
                                 &mut stream,
                                 single_piece,
-                                expected_length,
+                                expected_len,
                             ) {
-                                Ok(piece_data) => {
-                                    let offset = (single_piece as u64) * piece_length as u64;
-                                    output.seek(SeekFrom::Start(offset))?;
-                                    output.write_all(&piece_data)?;
-                                    println!(
-                                        "Wrote piece {} directly into output file",
-                                        single_piece
-                                    );
+                                Ok(data) => {
+                                    output.seek(SeekFrom::Start(
+                                        single_piece as u64 * piece_len as u64,
+                                    ))?;
+                                    output.write_all(&data)?;
+                                    println!("Wrote piece {} to output", single_piece);
                                 }
                                 Err(e) => {
                                     eprintln!("Failed to download piece {}: {}", single_piece, e);
-                                    continue; // Try next peer
+                                    continue;
                                 }
                             }
                         }
                         None => {
-                            for piece_idx in 0..num_pieces {
-                                let expected_length = if piece_idx == num_pieces - 1 {
-                                    let remaining = (total_length % piece_length as u64) as u32;
-                                    if remaining == 0 {
-                                        piece_length
+                            for i in 0..num_pieces {
+                                let expected_len = if i == num_pieces - 1 {
+                                    let r = (total_len % piece_len as u64) as u32;
+                                    if r == 0 {
+                                        piece_len
                                     } else {
-                                        remaining
+                                        r
                                     }
                                 } else {
-                                    piece_length
+                                    piece_len
                                 };
-
-                                println!(
-                                    "Requesting piece {} ({} bytes)",
-                                    piece_idx, expected_length
-                                );
-
                                 match crate::peer::download_piece(
                                     &mut stream,
-                                    piece_idx as u32,
-                                    expected_length,
+                                    i as u32,
+                                    expected_len,
                                 ) {
-                                    Ok(piece_data) => {
-                                        let offset = piece_idx * piece_length as u64;
-                                        output.seek(SeekFrom::Start(offset))?;
-                                        output.write_all(&piece_data)?;
-                                        println!("Wrote piece {} into output", piece_idx);
+                                    Ok(data) => {
+                                        output
+                                            .seek(SeekFrom::Start(i as u64 * piece_len as u64))?;
+                                        output.write_all(&data)?;
+                                        println!("Wrote piece {} to output", i);
                                     }
                                     Err(e) => {
-                                        eprintln!("Failed to download piece {}: {}", piece_idx, e);
-                                        break; // Try another peer maybe
+                                        eprintln!("Failed to download piece {}: {}", i, e);
+                                        break;
                                     }
                                 }
                             }
