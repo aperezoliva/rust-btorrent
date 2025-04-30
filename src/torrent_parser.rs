@@ -1,3 +1,4 @@
+use crate::peer::read_bitfield;
 use crate::tracker::PeerInfo;
 use egui::ProgressBar;
 use rand::seq::SliceRandom;
@@ -381,7 +382,10 @@ pub fn download_pieces(
 
                 if crate::peer::perform_handshake(&mut stream, &info_hash, &peer_id).is_ok()
                     && crate::peer::send_interested(&mut stream).is_ok()
-                    && crate::peer::wait_for_unchoke(&mut stream).is_ok()
+                    && matches!(
+                        crate::peer::wait_for_unchoke(&mut stream)?,
+                        crate::peer::PeerState::Unchoked
+                    )
                 {
                     println!("Handshake, interested, and unchoke successful!");
 
@@ -392,6 +396,17 @@ pub fn download_pieces(
                         return Err("Invalid torrent: piece length is zero.".into());
                     }
 
+                    let num_pieces = (total_length + piece_length as u64 - 1) / piece_length as u64;
+                    let num_pieces = num_pieces as usize;
+
+                    if let Ok(bitfield) = read_bitfield(&mut stream, num_pieces) {
+                        println!(
+                            "Bitfield received: peer has {} pieces",
+                            bitfield.iter().filter(|&&b| b).count()
+                        );
+                    } else {
+                        println!("Peer didn't send a bitfield or message was malformed.");
+                    }
                     let num_pieces = (total_length + piece_length as u64 - 1) / piece_length as u64;
 
                     let mut output = OpenOptions::new()
