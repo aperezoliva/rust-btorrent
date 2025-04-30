@@ -1,12 +1,9 @@
-use crate::peer::read_bitfield;
 use crate::tracker::PeerInfo;
 use egui::ProgressBar;
 use serde::{Deserialize, Serialize};
 use serde_bencode::{from_bytes, value::Value};
 use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
-use std::fs::OpenOptions;
-use std::io;
 
 // Struct representing the 'info' dictionary usually supplied by a torrent file
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -15,7 +12,7 @@ pub struct Info {
     pub length: Option<u64>, // single file
     #[serde(default)]
     pub files: Option<Vec<FileEntry>>, // multi-file
-    #[serde(default)]
+    #[serde(rename = "piece length")]
     pub piece_length: u64,
     pub pieces: ByteBuf,
 }
@@ -172,22 +169,26 @@ impl eframe::App for TorrentApp {
                 }
             }
 
-            if ui.button("Download Piece 0").clicked() {
-                if let Some(ref loaded_torrent) = self.loaded_torrent {
-                    let torrent = &loaded_torrent.torrent;
-                    let info_bytes = &loaded_torrent.info_bytes;
-                    match download_pieces(&self.peers, torrent, info_bytes, Some(0)) {
+            if ui
+                .button("Download Pieces with aria2c (fallback)")
+                .clicked()
+            {
+                if let Some(ref _loaded_torrent) = self.loaded_torrent {
+                    match crate::peer::launch_aria2c_with_torrent(&self.file_path) {
                         Ok(_) => {
-                            self.status_message = "Piece 0 downloaded successfully.".to_string()
+                            self.status_message = "aria2c started successfully.".to_string();
                         }
                         Err(e) => {
-                            self.status_message = format!("Failed to download piece 0: {}", e)
+                            self.status_message = format!("aria2c failed: {}", e);
                         }
                     }
                 }
             }
 
-            if ui.button("Download All Pieces").clicked() {
+            if ui
+                .button("Download Pieces with personal protocol")
+                .clicked()
+            {
                 if let Some(ref loaded_torrent) = self.loaded_torrent {
                     let torrent = &loaded_torrent.torrent;
                     let info_bytes = &loaded_torrent.info_bytes;
@@ -268,79 +269,83 @@ pub fn compute_info_hash(info_bytes: &[u8]) -> [u8; 20] {
 
 // Only loads the torrent file and parses it into a Torrent struct, doesn't contact tracker yet
 pub fn parse_torrent_file(path: &str) -> Result<LoadedTorrent, Box<dyn std::error::Error>> {
-    // Trim quotes around path just in case, this is unnecessary tbh
     let path = path.trim_matches('"');
     println!("Trying to load file: {}", path);
 
-    // Like any other good program, check if the object (file) is there, if not, yell at the user
     if !std::path::Path::new(path).exists() {
-        eprintln!("Error: File '{}' does not exist!", path);
         return Err("File not found".into());
     }
 
-    // Reads raw bytes and prints hex data
     let data = std::fs::read(path)?;
-    println!("Raw data (hex): {:?}", hex::encode(&data));
-
-    // Try to decode raw bencode
-    // https://en.wikipedia.org/wiki/Bencode (it's pronounced BEE-encode btw)
+    let root: Value = serde_bencode::from_bytes(&data)?;
     let decoded = serde_bencode::from_bytes::<Value>(&data)?;
-
-    // Dig inside top-level dictionary to find the 'info' dictionary
     let info_value = match &decoded {
         Value::Dict(dict) => dict.get(&b"info"[..]).ok_or("Missing 'info' field")?,
         _ => return Err("Torrent file is not a bencoded dictionary".into()),
     };
 
-    // Re-serialize just the 'info' dictionary back into bencode
-    // Important: because tracker and peers expect EXACT same info_hash
+    // DEBUG: print raw info dictionary before decoding
+    println!("Raw 'info' bencode: {:?}", info_value);
+
+    // Re-serialize just the 'info' dictionary
     let info_bytes = serde_bencode::to_bytes(info_value)?;
 
-    // Deserialize full .torrent file into Torrent struct
-    let mut torrent: Torrent = from_bytes(&data)?;
-
-    // Parse and overwrite the info field manually to ensure full correctness
+    // Deserialize 'info' into Info struct
     let info: Info = from_bytes(&info_bytes)?;
-    torrent.info = info;
+    println!(
+        "Decoded Info struct:\n  piece_length: {}\n  name: {}\n  pieces.len(): {}",
+        info.piece_length,
+        info.name,
+        info.pieces.len()
+    );
 
-    let mut torrent = torrent;
+    // Manually extract announce and announce-list
+    let (announce, announce_list) = match &root {
+        Value::Dict(dict) => {
+            let announce = dict.get(&b"announce"[..]).and_then(|v| match v {
+                Value::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).to_string()),
+                _ => None,
+            });
 
-    // If announce field is missing, fallback to first HTTP tracker in announce-list
-    if torrent.announce.is_none() {
-        if let Some(lists) = &torrent.announce_list {
-            for tracker_list in lists {
-                for tracker in tracker_list {
-                    if tracker.starts_with("http") {
-                        torrent.announce = Some(tracker.clone());
-                        println!("Using HTTP tracker from announce-list: {}", tracker);
-                        break;
+            let announce_list = dict.get(&b"announce-list"[..]).and_then(|v| match v {
+                Value::List(list_of_lists) => {
+                    let mut outer = Vec::new();
+                    for inner in list_of_lists {
+                        if let Value::List(inner_list) = inner {
+                            let urls = inner_list
+                                .iter()
+                                .filter_map(|v| {
+                                    if let Value::Bytes(b) = v {
+                                        Some(String::from_utf8_lossy(b).to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            outer.push(urls);
+                        }
                     }
+                    Some(outer)
                 }
-                if torrent.announce.is_some() {
-                    break;
-                }
-            }
+                _ => None,
+            });
+
+            (announce, announce_list)
         }
-    }
+        _ => (None, None),
+    };
 
-    // Final safety check
-    if torrent.announce.is_none() {
-        return Err("No HTTP announce URL found in torrent file.".into());
-    }
+    let torrent = Torrent {
+        announce,
+        announce_list,
+        info,
+    };
 
-    // Print a pretty debug tree of the decoded bencode structure
-    if let Ok(decoded) = serde_bencode::from_bytes::<Value>(&data) {
-        println!("Decoded Bencode Tree:");
-        print_bencode_tree(&decoded, 0);
-    }
-
-    // Return both the parsed Torrent and the raw info dict bytes
     Ok(LoadedTorrent {
         torrent,
         info_bytes,
     })
 }
-
 pub fn download_pieces(
     peers: &[PeerInfo],
     torrent: &Torrent,
@@ -355,17 +360,12 @@ pub fn download_pieces(
     let info_hash = compute_info_hash(info_bytes);
     let peer_id = crate::peer::generate_peer_id();
 
-    // If torrent is missing metadata, attempt to recover it from peers
     if torrent.info.piece_length == 0 {
-        return Err(Box::new(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Loaded .torrent file has invalid piece_length = 0",
-        )));
+        return Err("Loaded .torrent file has invalid piece_length = 0".into());
     }
 
     for peer in &shuffled_peers {
         println!("Trying to connect to {}:{}", peer.ip, peer.port);
-
         match std::net::TcpStream::connect((peer.ip.as_str(), peer.port)) {
             Ok(mut stream) => {
                 println!("Connected to peer {}:{}", peer.ip, peer.port);
@@ -400,5 +400,9 @@ pub fn download_pieces(
         }
     }
 
-    Err("Failed to download from any peer.".into())
+    eprintln!("All peer attempts failed. Falling back to aria2c...");
+    let path = crate::peer::write_metadata_to_file(info_bytes)?;
+    crate::peer::launch_aria2c_with_torrent(&path)?;
+    let _ = std::fs::remove_file(&path);
+    Ok(())
 }
