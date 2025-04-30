@@ -139,8 +139,8 @@ pub fn wait_for_unchoke(stream: &mut TcpStream) -> io::Result<PeerState> {
     let start = Instant::now();
 
     loop {
-        if start.elapsed().as_secs() > 10 {
-            println!("⏱️ Timeout reached while waiting for unchoke.");
+        if start.elapsed().as_secs() > 60 {
+            println!("Timeout reached while waiting for unchoke."); // Chatgpt suggested block to set a timeout for unchoke, modified to allow for longer wait time
             return Ok(PeerState::NotUnchoked);
         }
 
