@@ -1,14 +1,11 @@
 // for generating random peer ids and handshake operations
 use crate::torrent_parser::{Info, Torrent};
 use rand::{distr::Alphanumeric, rngs::ThreadRng, Rng};
-use serde_bencode::de;
 use serde_bencode::from_bytes;
 use serde_bencode::value::Value;
-use sha1::Digest;
-use sha1::Sha1;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // Generates peer id
 pub fn generate_peer_id() -> [u8; 20] {
@@ -24,10 +21,7 @@ pub fn generate_peer_id() -> [u8; 20] {
 
     peer_id
 }
-pub enum PeerState {
-    Unchoked,
-    NotUnchoked,
-}
+
 // Performs bittorrent handshake over open TCP stream
 // Wikipedia article on handshakes: https://en.wikipedia.org/wiki/Handshake_(computing)
 // Documentation on TcpStream https://doc.rust-lang.org/std/net/struct.TcpStream.html
@@ -123,33 +117,8 @@ pub fn send_interested(stream: &mut TcpStream) -> io::Result<()> {
     Ok(())
 }
 
-pub fn decode_bitfield(payload: &[u8]) -> Vec<u32> {
-    let mut pieces = Vec::new();
-
-    for (byte_index, byte) in payload.iter().enumerate() {
-        for bit in 0..8 {
-            if byte & (0b1000_0000 >> bit) != 0 {
-                let piece_index = (byte_index * 8 + bit) as u32;
-                pieces.push(piece_index);
-            }
-        }
-    }
-
-    pieces
-}
-
 // Unchoke refers to peers allowing the client to download pieces
 /* Implemented some new changes per https://stackoverflow.com/questions/53531493/peers-not-sending-back-unchoke-message */
-const CHOKE: u8 = 0;
-const UNCHOKE: u8 = 1;
-const INTERESTED: u8 = 2;
-const NOT_INTERESTED: u8 = 3;
-const HAVE: u8 = 4;
-const BITFIELD: u8 = 5;
-const REQUEST: u8 = 6;
-const PIECE: u8 = 7;
-const CANCEL: u8 = 8;
-const PORT: u8 = 9;
 
 pub fn wait_until_unchoked(stream: &mut std::net::TcpStream) -> io::Result<()> {
     use std::io::ErrorKind;
@@ -395,32 +364,10 @@ pub fn download_piece(
     Ok(piece_data)
 }
 
-pub fn download_one_block(stream: &mut TcpStream, piece_length: u32) -> io::Result<Vec<u8>> {
-    const STANDARD_BLOCK_SIZE: u32 = 16384; // 16 KB standard request size
-
-    let piece_index = 0;
-    let block_offset = 0;
-
-    if piece_length == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Piece length is zero — cannot request data.",
-        ));
-    }
-
-    let request_size = piece_length.min(STANDARD_BLOCK_SIZE); // Cap to piece size if needed
-
-    send_request(stream, piece_index, block_offset, request_size)?;
-
-    let (_piece_idx, _block_offset, block_data) = receive_piece(stream)?;
-
-    Ok(block_data)
-}
-
 pub fn send_extended_handshake(stream: &mut TcpStream) -> io::Result<(u8, u64)> {
     use serde_bencode::de;
 
-    let mut payload = b"d1:md11:ut_metadatai1ee".to_vec(); // {"m": {"ut_metadata": 1}}
+    let payload = b"d1:md11:ut_metadatai1ee".to_vec(); // {"m": {"ut_metadata": 1}}
     let mut message = Vec::new();
     let total_length = payload.len() as u32 + 2;
     message.extend_from_slice(&total_length.to_be_bytes());
@@ -679,13 +626,6 @@ pub fn download_metadata(
     );
 
     Ok(full_metadata)
-}
-
-pub fn compute_info_hash(metadata: &[u8]) -> [u8; 20] {
-    let mut hasher = Sha1::new();
-    hasher.update(metadata);
-    let result = hasher.finalize();
-    result.into()
 }
 
 pub fn parse_metadata(metadata: &[u8]) -> Result<Torrent, Box<dyn std::error::Error>> {

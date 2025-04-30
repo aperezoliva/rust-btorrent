@@ -1,13 +1,11 @@
 use crate::peer::read_bitfield;
 use crate::tracker::PeerInfo;
 use egui::ProgressBar;
-use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_bencode::{from_bytes, value::Value};
 use serde_bytes::ByteBuf;
 use sha1::{Digest, Sha1};
 use std::fs::OpenOptions;
-use std::io::{Seek, SeekFrom, Write};
 
 // Struct representing the 'info' dictionary usually supplied by a torrent file
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -347,7 +345,7 @@ pub fn download_pieces(
     use rand::seq::SliceRandom;
     use std::io::{Seek, SeekFrom, Write};
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut shuffled_peers = peers.to_vec();
     shuffled_peers.shuffle(&mut rng);
 
@@ -373,7 +371,7 @@ pub fn download_pieces(
                     let _ = stream.write_all(&[0, 0, 0, 2, 5, 0]); // empty bitfield
                     println!("Sent fake bitfield");
 
-                    let (resolved_torrent, total_len, piece_len, resolved_info_bytes) =
+                    let (_resolved_torrent, total_len, piece_len, _resolved_info_bytess) =
                         if torrent.info.piece_length == 0 {
                             println!(
                             "Torrent file is missing piece length. Attempting metadata exchange..."
@@ -461,7 +459,7 @@ pub fn download_pieces(
                                 }
                             }
                         }
-                        None => {
+                        _none => {
                             for i in 0..num_pieces {
                                 let expected_len = if i == num_pieces - 1 {
                                     let r = (total_len % piece_len as u64) as u32;
