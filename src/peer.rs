@@ -55,10 +55,10 @@ pub fn write_metadata_to_file(metadata: &[u8]) -> std::io::Result<String> {
 
 pub fn launch_aria2c_with_torrent_in_dir(
     torrent_path: &str,
-    output_dir: &str,
+    download_dir: &str,
 ) -> std::io::Result<()> {
     let status = Command::new("aria2c")
-        .arg(format!("--dir={}", output_dir))
+        .arg(format!("--dir={}", download_dir))
         .arg("--seed-time=0")
         .arg(torrent_path)
         .status()?;

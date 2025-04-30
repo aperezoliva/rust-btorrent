@@ -64,89 +64,95 @@ impl Default for TorrentApp {
 impl eframe::App for TorrentApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Torrent Parser");
-            ui.label("Enter .torrent file path:");
-            ui.text_edit_singleline(&mut self.file_path);
-            if ui.button("Select Download Folder").clicked() {
-                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                    self.download_dir = Some(folder.display().to_string());
-                    println!(
-                        "Selected download folder: {}",
-                        self.download_dir.as_ref().unwrap()
-                    );
-                }
-            }
-            if ui.button("Browse .torrent file").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Torrent", &["torrent"])
-                    .pick_file()
-                {
-                    self.file_path = path.display().to_string();
-                }
-            }
+            ui.vertical_centered(|ui| {
+                ui.heading("Torrent Parser");
+            });
 
-            if ui.button("Load Torrent").clicked() {
-                match parse_torrent_file(&self.file_path) {
-                    Ok(loaded_torrent) => {
-                        self.loaded_torrent = Some(loaded_torrent);
-                        self.peers.clear();
-                        self.status_message = "Torrent loaded successfully.".to_string();
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to parse: {}", e);
-                        self.status_message = format!("Failed to load torrent: {}", e);
-                        self.loaded_torrent = None;
-                        self.peers.clear();
-                    }
-                }
-            }
+            ui.add_space(10.0);
 
-            if ui.button("Find Peers").clicked() {
-                if let Some(ref loaded_torrent) = self.loaded_torrent {
-                    let torrent = &loaded_torrent.torrent;
-                    let info_hash = compute_info_hash(&loaded_torrent.info_bytes);
-                    let mut handles = Vec::new();
-                    let peer_id = crate::peer::generate_peer_id();
-
-                    if let Some(ref announce_url) = torrent.announce {
-                        let info_hash = info_hash.clone();
-                        let announce_url = announce_url.clone();
-                        let peer_id = peer_id.clone();
-                        handles.push(std::thread::spawn(move || {
-                            if announce_url.starts_with("http") {
-                                crate::tracker::contact_tracker(&announce_url, &info_hash, 0).ok()
-                            } else if announce_url.starts_with("udp") {
-                                crate::tracker::contact_udp_tracker(
-                                    &announce_url,
-                                    &info_hash,
-                                    &peer_id,
-                                )
-                                .ok()
-                                .map(|peers| {
-                                    peers
-                                        .into_iter()
-                                        .map(|(ip, port)| crate::tracker::PeerInfo { ip, port })
-                                        .collect()
-                                })
-                            } else {
-                                None
+            // File Selection Section
+            egui::Frame::default()
+                .fill(ui.visuals().panel_fill)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.label("🔍 File Selection");
+                    ui.horizontal(|ui| {
+                        ui.label("Path:");
+                        ui.text_edit_singleline(&mut self.file_path);
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Browse .torrent file").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Torrent", &["torrent"])
+                                .pick_file()
+                            {
+                                self.file_path = path.display().to_string();
                             }
-                        }));
+                        }
+
+                        if ui.button("Select Download Folder").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                self.download_dir = Some(folder.display().to_string());
+                                println!(
+                                    "Selected download folder: {}",
+                                    self.download_dir.as_ref().unwrap()
+                                );
+                            }
+                        }
+                    });
+
+                    if let Some(ref dir) = self.download_dir {
+                        ui.label(format!("Selected folder: {}", dir));
+                    }
+                });
+
+            ui.add_space(10.0);
+
+            // Action Buttons
+            egui::Frame::default()
+                .fill(ui.visuals().panel_fill)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.label("Actions");
+
+                    if ui.button("Load Torrent").clicked() {
+                        match parse_torrent_file(&self.file_path) {
+                            Ok(loaded_torrent) => {
+                                self.loaded_torrent = Some(loaded_torrent);
+                                self.peers.clear();
+                                self.status_message = "Torrent loaded successfully.".to_string();
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to parse: {}", e);
+                                self.status_message = format!("Failed to load torrent: {}", e);
+                                self.loaded_torrent = None;
+                                self.peers.clear();
+                            }
+                        }
                     }
 
-                    if let Some(ref announce_list) = torrent.announce_list {
-                        for tracker_list in announce_list {
-                            for tracker_url in tracker_list {
-                                let tracker_url = tracker_url.clone();
+                    if ui.button("Find Peers").clicked() {
+                        if let Some(ref loaded_torrent) = self.loaded_torrent {
+                            let torrent = &loaded_torrent.torrent;
+                            let info_hash = compute_info_hash(&loaded_torrent.info_bytes);
+                            let mut handles = Vec::new();
+                            let peer_id = crate::peer::generate_peer_id();
+
+                            if let Some(ref announce_url) = torrent.announce {
                                 let info_hash = info_hash.clone();
+                                let announce_url = announce_url.clone();
                                 let peer_id = peer_id.clone();
                                 handles.push(std::thread::spawn(move || {
-                                    if tracker_url.starts_with("http") {
-                                        crate::tracker::contact_tracker(&tracker_url, &info_hash, 0)
-                                            .ok()
-                                    } else if tracker_url.starts_with("udp") {
+                                    if announce_url.starts_with("http") {
+                                        crate::tracker::contact_tracker(
+                                            &announce_url,
+                                            &info_hash,
+                                            0,
+                                        )
+                                        .ok()
+                                    } else if announce_url.starts_with("udp") {
                                         crate::tracker::contact_udp_tracker(
-                                            &tracker_url,
+                                            &announce_url,
                                             &info_hash,
                                             &peer_id,
                                         )
@@ -165,91 +171,140 @@ impl eframe::App for TorrentApp {
                                     }
                                 }));
                             }
+
+                            if let Some(ref announce_list) = torrent.announce_list {
+                                for tracker_list in announce_list {
+                                    for tracker_url in tracker_list {
+                                        let tracker_url = tracker_url.clone();
+                                        let info_hash = info_hash.clone();
+                                        let peer_id = peer_id.clone();
+                                        handles.push(std::thread::spawn(move || {
+                                            if tracker_url.starts_with("http") {
+                                                crate::tracker::contact_tracker(
+                                                    &tracker_url,
+                                                    &info_hash,
+                                                    0,
+                                                )
+                                                .ok()
+                                            } else if tracker_url.starts_with("udp") {
+                                                crate::tracker::contact_udp_tracker(
+                                                    &tracker_url,
+                                                    &info_hash,
+                                                    &peer_id,
+                                                )
+                                                .ok()
+                                                .map(|peers| {
+                                                    peers
+                                                        .into_iter()
+                                                        .map(|(ip, port)| {
+                                                            crate::tracker::PeerInfo { ip, port }
+                                                        })
+                                                        .collect()
+                                                })
+                                            } else {
+                                                None
+                                            }
+                                        }));
+                                    }
+                                }
+                            }
+
+                            let mut all_peers = Vec::new();
+                            for handle in handles {
+                                if let Ok(Some(peers)) = handle.join() {
+                                    all_peers.extend(peers);
+                                }
+                            }
+
+                            self.peers = all_peers;
+                            self.status_message = if self.peers.is_empty() {
+                                "No peers found.".to_string()
+                            } else {
+                                format!("Found {} peers.", self.peers.len())
+                            };
+                        } else {
+                            eprintln!("No torrent loaded!");
                         }
                     }
 
-                    let mut all_peers = Vec::new();
-                    for handle in handles {
-                        if let Ok(Some(peers)) = handle.join() {
-                            all_peers.extend(peers);
+                    if ui.button("Download with aria2c (fallback)").clicked() {
+                        if let Some(ref _loaded_torrent) = self.loaded_torrent {
+                            let output_dir = self
+                                .download_dir
+                                .clone()
+                                .unwrap_or_else(|| "downloads".to_string());
+
+                            match crate::peer::launch_aria2c_with_torrent_in_dir(
+                                &self.file_path,
+                                &output_dir,
+                            ) {
+                                Ok(_) => {
+                                    self.status_message = format!(
+                                        "aria2c download complete to folder: {}",
+                                        output_dir
+                                    );
+                                }
+                                Err(e) => {
+                                    self.status_message = format!("aria2c failed: {}", e);
+                                }
+                            }
                         }
                     }
-                    self.peers = all_peers;
-                    self.status_message = if self.peers.is_empty() {
-                        "No peers found.".to_string()
-                    } else {
-                        format!("Found {} peers.", self.peers.len())
-                    };
-                } else {
-                    eprintln!("No torrent loaded!");
-                }
-            }
 
-            if ui
-                .button("Download Pieces with aria2c (fallback)")
-                .clicked()
-            {
-                if let Some(ref _loaded_torrent) = self.loaded_torrent {
-                    let output_dir = self
-                        .download_dir
-                        .clone()
-                        .unwrap_or_else(|| "downloads".to_string());
-
-                    match crate::peer::launch_aria2c_with_torrent_in_dir(
-                        &self.file_path,
-                        &output_dir,
-                    ) {
-                        Ok(_) => {
-                            self.status_message = "aria2c started successfully.".to_string();
-                        }
-                        Err(e) => {
-                            self.status_message = format!("aria2c failed: {}", e);
+                    if ui
+                        .button("Download (personal protocol, unstable)")
+                        .clicked()
+                    {
+                        if let Some(ref loaded_torrent) = self.loaded_torrent {
+                            let torrent = &loaded_torrent.torrent;
+                            let info_bytes = &loaded_torrent.info_bytes;
+                            let dir = self
+                                .download_dir
+                                .clone()
+                                .unwrap_or_else(|| "downloads".to_string());
+                            match download_pieces(&self.peers, torrent, info_bytes, None, &dir) {
+                                Ok(_) => {
+                                    self.status_message =
+                                        "All pieces downloaded successfully.".to_string()
+                                }
+                                Err(e) => {
+                                    self.status_message =
+                                        format!("Failed to download all pieces: {}", e)
+                                }
+                            }
                         }
                     }
-                }
-            }
+                });
 
-            if ui
-                .button("Download Pieces with personal protocol (not properly functioning)")
-                .clicked()
-            {
-                if let Some(ref loaded_torrent) = self.loaded_torrent {
-                    let torrent = &loaded_torrent.torrent;
-                    let info_bytes = &loaded_torrent.info_bytes;
-                    let dir = self
-                        .download_dir
-                        .clone()
-                        .unwrap_or_else(|| "downloads".to_string());
-                    match download_pieces(&self.peers, torrent, info_bytes, None, &dir) {
-                        Ok(_) => {
-                            self.status_message = "All pieces downloaded successfully.".to_string()
-                        }
-                        Err(e) => {
-                            self.status_message = format!("Failed to download all pieces: {}", e)
-                        }
-                    }
-                }
-            }
+            ui.add_space(10.0);
 
+            // Torrent Info Section
             if let Some(ref loaded_torrent) = self.loaded_torrent {
                 let torrent = &loaded_torrent.torrent;
-                if let Some(ref announce_url) = torrent.announce {
-                    ui.label(format!("Tracker URL: {}", announce_url));
-                } else {
-                    ui.label("Tracker URL: (None found)");
-                }
-                ui.label(format!("Name: {}", torrent.info.name));
-                if let Some(length) = torrent.info.length {
-                    ui.label(format!("Length: {} bytes", length));
-                }
-                ui.label(format!("Piece Length: {} bytes", torrent.info.piece_length));
-                ui.separator();
+                egui::Frame::default()
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.label("Torrent Info");
+                        if let Some(ref announce_url) = torrent.announce {
+                            ui.label(format!("Tracker URL: {}", announce_url));
+                        } else {
+                            ui.label("Tracker URL: (None found)");
+                        }
+                        ui.label(format!("Name: {}", torrent.info.name));
+                        if let Some(length) = torrent.info.length {
+                            ui.label(format!("Length: {} bytes", length));
+                        }
+                        ui.label(format!("Piece Length: {} bytes", torrent.info.piece_length));
+                    });
             }
+
             ui.separator();
             ui.label(format!("Status: {}", self.status_message));
         });
     }
 }
+
 // Bencode data gets printed recursively for debugging purposes, might comment out since it's slowing
 // The terminal (i think)
 // fn print_bencode_tree(value: &Value, indent: usize) {
@@ -431,6 +486,10 @@ pub fn download_pieces(
     let path = crate::peer::write_metadata_to_file(info_bytes)?;
     let output_dir = "downloads";
     crate::peer::launch_aria2c_with_torrent_in_dir(&path, output_dir)?;
-    let _ = std::fs::remove_file(&path);
+    match std::fs::remove_file("final_output.bin") {
+        Ok(_) => println!("Removed final_output.bin"),
+        Err(e) => eprintln!("Failed to remove final_output.bin: {}", e),
+    }
+
     Ok(())
 }
