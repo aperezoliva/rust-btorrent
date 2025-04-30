@@ -343,161 +343,47 @@ pub fn download_pieces(
     piece_index: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use rand::seq::SliceRandom;
-    use std::io::{Seek, SeekFrom, Write};
 
-    let mut rng = rand::rng();
+    let mut rng = rand::thread_rng();
     let mut shuffled_peers = peers.to_vec();
     shuffled_peers.shuffle(&mut rng);
 
-    let original_info_hash = compute_info_hash(info_bytes);
+    let info_hash = compute_info_hash(info_bytes);
     let peer_id = crate::peer::generate_peer_id();
 
     for peer in &shuffled_peers {
         println!("Trying to connect to {}:{}", peer.ip, peer.port);
+
         match std::net::TcpStream::connect((peer.ip.as_str(), peer.port)) {
             Ok(mut stream) => {
                 println!("Connected to peer {}:{}", peer.ip, peer.port);
 
-                if crate::peer::perform_handshake(&mut stream, &original_info_hash, &peer_id)
-                    .is_ok()
-                    && crate::peer::send_interested(&mut stream).is_ok()
-                    && crate::peer::wait_until_unchoked(&mut stream).is_ok()
-                {
-                    println!("Handshake, interested, and unchoke successful!");
-
-                    // Send fake 'have' and bitfield to trigger optimistic unchoke behavior
-                    let _ = stream.write_all(&[0, 0, 0, 5, 4, 0, 0, 0, 0]);
-                    println!("Sent fake 'have' message for piece 0");
-                    let _ = stream.write_all(&[0, 0, 0, 2, 5, 0]); // empty bitfield
-                    println!("Sent fake bitfield");
-
-                    let (_resolved_torrent, total_len, piece_len, _resolved_info_bytess) =
-                        if torrent.info.piece_length == 0 {
-                            println!(
-                            "Torrent file is missing piece length. Attempting metadata exchange..."
+                match crate::peer::peer_loop(
+                    &mut stream,
+                    &peer_id,
+                    &info_hash,
+                    torrent,
+                    info_bytes,
+                    piece_index,
+                ) {
+                    Ok(_) => {
+                        println!("Download completed successfully from peer.");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Peer loop failed with peer {}:{} — {}",
+                            peer.ip, peer.port, e
                         );
-                            match crate::peer::send_extended_handshake(&mut stream)
-                                .and_then(|(ext_id, size)| {
-                                    crate::peer::download_metadata(&mut stream, ext_id, size)
-                                })
-                                .and_then(|metadata| {
-                                    let parsed =
-                                        crate::peer::parse_metadata(&metadata).map_err(|e| {
-                                            std::io::Error::new(
-                                                std::io::ErrorKind::InvalidData,
-                                                e.to_string(),
-                                            )
-                                        })?;
-                                    let piece_len = parsed.info.piece_length;
-                                    let length = parsed.info.length.ok_or_else(|| {
-                                        std::io::Error::new(
-                                            std::io::ErrorKind::InvalidData,
-                                            "Missing file length",
-                                        )
-                                    })?;
-
-                                    // Clone parsed only once here
-                                    Ok((parsed.clone(), length, piece_len, metadata))
-                                }) {
-                                Ok((t, l, p, b)) => (t, l, p, b),
-                                Err(e) => {
-                                    eprintln!("Metadata fetch failed: {e}");
-                                    continue;
-                                }
-                            }
-                        } else {
-                            (
-                                torrent.clone(),
-                                torrent.info.length.unwrap_or(0),
-                                torrent.info.piece_length,
-                                info_bytes.to_vec(),
-                            )
-                        };
-
-                    if piece_len == 0 {
-                        return Err("Invalid torrent: piece length is zero.".into());
+                        continue;
                     }
-
-                    let piece_len = piece_len as u32;
-                    let num_pieces =
-                        ((total_len + piece_len as u64 - 1) / piece_len as u64) as usize;
-
-                    if let Ok(bitfield) = read_bitfield(&mut stream, num_pieces) {
-                        println!(
-                            "Bitfield received: peer has {} pieces",
-                            bitfield.iter().filter(|&&b| b).count()
-                        );
-                    }
-
-                    let mut output = OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .open("final_output.bin")?;
-
-                    match piece_index {
-                        Some(single_piece) => {
-                            let expected_len = if num_pieces == 1 {
-                                total_len as u32
-                            } else {
-                                piece_len
-                            };
-                            match crate::peer::download_piece(
-                                &mut stream,
-                                single_piece,
-                                expected_len,
-                            ) {
-                                Ok(data) => {
-                                    output.seek(SeekFrom::Start(
-                                        single_piece as u64 * piece_len as u64,
-                                    ))?;
-                                    output.write_all(&data)?;
-                                    println!("Wrote piece {} to output", single_piece);
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to download piece {}: {}", single_piece, e);
-                                    continue;
-                                }
-                            }
-                        }
-                        _none => {
-                            for i in 0..num_pieces {
-                                let expected_len = if i == num_pieces - 1 {
-                                    let r = (total_len % piece_len as u64) as u32;
-                                    if r == 0 {
-                                        piece_len
-                                    } else {
-                                        r
-                                    }
-                                } else {
-                                    piece_len
-                                };
-                                match crate::peer::download_piece(
-                                    &mut stream,
-                                    i as u32,
-                                    expected_len,
-                                ) {
-                                    Ok(data) => {
-                                        output
-                                            .seek(SeekFrom::Start(i as u64 * piece_len as u64))?;
-                                        output.write_all(&data)?;
-                                        println!("Wrote piece {} to output", i);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Failed to download piece {}: {}", i, e);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    return Ok(());
-                } else {
-                    eprintln!("Handshake or interested/unchoke failed with this peer.");
                 }
             }
             Err(e) => {
-                eprintln!("Failed to connect to peer: {}", e);
+                eprintln!(
+                    "Failed to connect to peer {}:{} — {}",
+                    peer.ip, peer.port, e
+                );
             }
         }
     }

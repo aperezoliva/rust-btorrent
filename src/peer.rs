@@ -3,7 +3,8 @@ use crate::torrent_parser::{Info, Torrent};
 use rand::{distr::Alphanumeric, rngs::ThreadRng, Rng};
 use serde_bencode::from_bytes;
 use serde_bencode::value::Value;
-use std::io::{self, Read, Write};
+use std::fs::OpenOptions;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -20,6 +21,114 @@ pub fn generate_peer_id() -> [u8; 20] {
     }
 
     peer_id
+}
+
+pub fn peer_loop(
+    stream: &mut TcpStream,
+    peer_id: &[u8; 20],
+    info_hash: &[u8; 20],
+    torrent: &Torrent,
+    info_bytes: &[u8],
+    piece_index: Option<u32>,
+) -> io::Result<()> {
+    perform_handshake(stream, info_hash, peer_id)?;
+    send_interested(stream)?;
+    wait_until_unchoked(stream)?;
+
+    // Trigger optimistic unchoke by pretending we have something
+    let _ = stream.write_all(&[0, 0, 0, 5, 4, 0, 0, 0, 0]);
+    let _ = stream.write_all(&[0, 0, 0, 2, 5, 0]);
+
+    // If .torrent lacks piece info, attempt metadata extension
+    let (resolved, total_len, piece_len, _) = if torrent.info.piece_length == 0 {
+        println!("Torrent file missing piece length. Attempting metadata exchange...");
+        let (ext_id, metadata_size) = send_extended_handshake(stream)?;
+        let metadata = download_metadata(stream, ext_id, metadata_size)?;
+        let parsed = parse_metadata(&metadata).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Metadata parse failed: {}", e),
+            )
+        })?;
+        let piece_len = parsed.info.piece_length;
+        let length = parsed.info.length.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Missing file length in metadata",
+            )
+        })?;
+        (parsed, length, piece_len, metadata)
+    } else {
+        (
+            torrent.clone(),
+            torrent.info.length.unwrap_or(0),
+            torrent.info.piece_length,
+            info_bytes.to_vec(),
+        )
+    };
+
+    if piece_len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Piece length is zero",
+        ));
+    }
+
+    let piece_len = piece_len as u32;
+    let num_pieces = ((total_len + piece_len as u64 - 1) / piece_len as u64) as usize;
+
+    if let Ok(bitfield) = read_bitfield(stream, num_pieces) {
+        println!(
+            "Bitfield received: peer has {} pieces",
+            bitfield.iter().filter(|&&b| b).count()
+        );
+    }
+
+    let mut output = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open("final_output.bin")?;
+
+    match piece_index {
+        Some(i) => {
+            let expected_len = if num_pieces == 1 {
+                total_len as u32
+            } else {
+                piece_len
+            };
+            let data = download_piece(stream, i, expected_len)?;
+            output.seek(SeekFrom::Start(i as u64 * piece_len as u64))?;
+            output.write_all(&data)?;
+            println!("Wrote piece {} to output", i);
+        }
+        None => {
+            for i in 0..num_pieces {
+                let expected_len = if i == num_pieces - 1 {
+                    let r = (total_len % piece_len as u64) as u32;
+                    if r == 0 {
+                        piece_len
+                    } else {
+                        r
+                    }
+                } else {
+                    piece_len
+                };
+                match download_piece(stream, i as u32, expected_len) {
+                    Ok(data) => {
+                        output.seek(SeekFrom::Start(i as u64 * piece_len as u64))?;
+                        output.write_all(&data)?;
+                        println!("Wrote piece {} to output", i);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to download piece {}: {}", i, e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // Performs bittorrent handshake over open TCP stream
