@@ -155,7 +155,7 @@ pub fn peer_loop(
     torrent: &Torrent,
     info_bytes: &[u8],
     piece_index: Option<u32>,
-    download_dir: &str,
+    _download_dir: &str,
 ) -> io::Result<()> {
     perform_handshake(stream, info_hash, peer_id)?;
     send_interested(stream)?;
